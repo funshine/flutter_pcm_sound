@@ -1,4 +1,4 @@
-
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 
@@ -31,7 +31,11 @@ class _PcmSoundAppState extends State<PcmSoundApp> {
   void initState() {
     super.initState();
     FlutterPcmSound.setLogLevel(LogLevel.verbose);
-    FlutterPcmSound.setup(sampleRate: sampleRate, channelCount: 1);
+    // Web cannot call setup on init. Setting up an AudioContext
+    // requires a user gesture.
+    if (!kIsWeb) {
+      FlutterPcmSound.setup(sampleRate: sampleRate, channelCount: 1);
+    }
     FlutterPcmSound.setFeedThreshold(sampleRate ~/ 10);
     FlutterPcmSound.setFeedCallback(_onFeed);
   }
@@ -66,6 +70,12 @@ class _PcmSoundAppState extends State<PcmSoundApp> {
             children: [
               ElevatedButton(
                 onPressed: () {
+                  if (kIsWeb) {
+                    // Web cannot call setup on init. Setting up an AudioContext
+                    // requires a user gesture.
+                    FlutterPcmSound.setup(
+                        sampleRate: sampleRate, channelCount: 1);
+                  }
                   FlutterPcmSound.setFeedCallback(_onFeed);
                   _onFeed(0); // start feeding
                 },

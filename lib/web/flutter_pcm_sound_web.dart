@@ -22,7 +22,6 @@ class FlutterPcmSoundPlugin {
   int _numChannels = 1;
   int _sampleRate = 44100;
   int _feedThreshold = 8000;
-  bool _invokedFeedCallback = false;
 
   FlutterPcmSoundPlugin._(this._channel);
 
@@ -32,8 +31,8 @@ class FlutterPcmSoundPlugin {
         return true; // Logging handled by print statements as needed.
       case 'setup':
         final args = call.arguments as Map;
-        _sampleRate = args['sample_rate'];
-        _numChannels = args['num_channels'];
+        _sampleRate = args['sample_rate'] ?? _sampleRate;
+        _numChannels = args['num_channels'] ?? _numChannels;
         await _initializeAudioWorklet();
         _didSetup = true;
         return true;
@@ -47,7 +46,6 @@ class FlutterPcmSoundPlugin {
           print("[PCM][ERROR] Received empty buffer.");
           return true;
         }
-        _invokedFeedCallback = false;
         _workletNode?.port
             .postMessage({'type': 'samples', 'samples': buffer}.jsify());
         return true;
@@ -101,7 +99,6 @@ class FlutterPcmSoundPlugin {
     if (data is Map) {
       if (data['type'] == 'requestMoreData') {
         final remainingFrames = data['remainingFrames'] as int;
-        _invokedFeedCallback = true;
         _channel.invokeMethod(
             'OnFeedSamples', {'remaining_frames': remainingFrames});
       } else if (data['type'] == 'configured') {
@@ -153,12 +150,18 @@ class PCMProcessor extends AudioWorkletProcessor {
           this.feedThreshold = data.feedThreshold;
           break;
         case 'samples':
-          // Append incoming PCM data to the queue as Int16
-          const samples = data.samples;
-          if (samples && samples.length > 0) {
-            this._queue.push(new Int16Array(samples));
-            this.invokedFeedCallback = false;
+          if (!data.samples || data.samples.length === 0) return;
+          
+          const bytes = new Uint8Array(data.samples);
+          const int16Samples = new Int16Array(bytes.length / 2);
+          
+          // Combine bytes into 16-bit samples (little-endian)
+          for (let i = 0; i < bytes.length; i += 2) {
+            int16Samples[i/2] = (bytes[i+1] << 8) | bytes[i];
           }
+          
+          this._queue.push(int16Samples);
+          this.invokedFeedCallback = false;
           break;
       }
     };
@@ -179,6 +182,7 @@ class PCMProcessor extends AudioWorkletProcessor {
       for (let f = 0; f < framesFromBuffer; f++) {
         for (let ch = 0; ch < this.numChannels; ch++) {
           const sampleInt = currentBuffer[f * this.numChannels + ch];
+          // Normalize 16-bit PCM to float.
           const sampleFloat = sampleInt / 32768.0;
           output[ch][framePos + f] = sampleFloat;
         }
@@ -193,6 +197,7 @@ class PCMProcessor extends AudioWorkletProcessor {
       framePos += framesFromBuffer;
     }
 
+    // Fill remaining frames with silence if needed
     while (framePos < framesNeeded) {
       for (let ch = 0; ch < this.numChannels; ch++) {
         output[ch][framePos] = 0.0;
