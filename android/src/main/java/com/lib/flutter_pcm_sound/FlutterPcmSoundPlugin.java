@@ -1,12 +1,15 @@
 package com.lib.flutter_pcm_sound;
 
-import android.os.Build;
+import android.content.Context;
+import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
-import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
 import android.os.SystemClock;
 
 import androidx.annotation.NonNull;
@@ -16,7 +19,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import java.io.StringWriter;
 import java.io.PrintWriter;
 import java.nio.ByteBuffer;
@@ -47,6 +49,12 @@ public class FlutterPcmSoundPlugin implements
     private int mMinBufferSize;
     private boolean mDidSetup = false;
 
+    // Needed for AudioFocus management.
+    private Context context;
+    private AudioManager audioManager;
+    private AudioFocusRequest focusRequest; 
+    private AudioAttributes playbackAttributes; 
+
     private long mFeedThreshold = 8000;
     private volatile boolean mDidInvokeFeedCallback = false;
 
@@ -68,6 +76,9 @@ public class FlutterPcmSoundPlugin implements
         BinaryMessenger messenger = binding.getBinaryMessenger();
         mMethodChannel = new MethodChannel(messenger, CHANNEL_NAME);
         mMethodChannel.setMethodCallHandler(this);
+
+        this.context = binding.getApplicationContext();
+        this.audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
     }
 
     @Override
@@ -149,7 +160,42 @@ public class FlutterPcmSoundPlugin implements
                     mDidInvokeFeedCallback = false;
                     mShouldCleanup = false;
 
-                    // start playback thread
+                    // Request audio focus for ducking
+                    if (audioManager != null) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            playbackAttributes = new AudioAttributes.Builder()
+                                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                    .build();
+
+                            focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                                    .setAudioAttributes(playbackAttributes)
+                                    .setOnAudioFocusChangeListener(focusChange -> {
+                                        // handle audio focus changes if needed
+                                    })
+                                    .build();
+
+                            int focusResult = audioManager.requestAudioFocus(focusRequest);
+                            if (focusResult != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                                result.error("AudioFocusError", "Could not get audio focus.", null);
+                                return;
+                            }
+                        } else {
+                            int focusResult = audioManager.requestAudioFocus(
+                                    focusChange -> {
+                                        // handle focus changes if needed
+                                    },
+                                    AudioManager.STREAM_MUSIC,
+                                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                            );
+                            if (focusResult != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                                result.error("AudioFocusError", "Could not get audio focus.", null);
+                                return;
+                            }
+                        }
+                    }
+
+                    // Start playback thread
                     playbackThread = new Thread(this::playbackThreadLoop, "PCMPlaybackThread");
                     playbackThread.setPriority(Thread.MAX_PRIORITY);
                     playbackThread.start();
@@ -231,6 +277,20 @@ public class FlutterPcmSoundPlugin implements
             playbackThread = null;
             mDidSetup = false;
         }
+
+        if (mAudioTrack != null) {
+            mAudioTrack.release();
+            mAudioTrack = null;
+        }
+
+        // Abandon audio focus
+        if (audioManager != null) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && focusRequest != null) {
+                audioManager.abandonAudioFocusRequest(focusRequest);
+            } else {
+                audioManager.abandonAudioFocus(null);
+            }
+        }
     }
 
     /**
@@ -259,7 +319,7 @@ public class FlutterPcmSoundPlugin implements
      * The main loop of the playback thread.
      */
     private void playbackThreadLoop() {
-        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
+        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
 
         mAudioTrack.play();
 
