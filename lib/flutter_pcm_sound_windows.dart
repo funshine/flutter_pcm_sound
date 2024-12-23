@@ -6,7 +6,7 @@ import 'package:win32/win32.dart';
 
 import 'flutter_pcm_sound.dart';
 
-class FlutterPcmSoundWindows {
+class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
   // WASAPI interfaces
   IAudioClient3? _audioClient;
   IAudioRenderClient? _renderClient;
@@ -223,7 +223,7 @@ class FlutterPcmSoundWindows {
   /// [buffer] is the client’s PCM data in 16-bit, interleaved format.
   /// [clientSampleRate] is e.g., 24000
   /// [clientChannels] is e.g., 1 (mono)
-  Future<void> feed(Uint8List buffer) async {
+  Future<void> feed(PcmArrayInt16 buffer) async {
     if (!_isInitialized) {
       _logError('Cannot feed: not initialized');
       return;
@@ -249,7 +249,7 @@ class FlutterPcmSoundWindows {
 
       if (numFramesAvailable > 0) {
         // Convert incoming buffer to Int16List
-        final inputSamples = buffer.buffer.asInt16List();
+        final inputSamples = buffer.bytes.buffer.asInt16List();
 
         // If client format != final system mix format, resample/upmix
         final Float32List finalData = _resampleIfNeeded(
@@ -396,5 +396,17 @@ class FlutterPcmSoundWindows {
     _renderClient = null;
     _isInitialized = false;
     _log('Resources released');
+  }
+  
+  @override
+  void setFeedCallback(Function(int p1)? callback) {
+    // TODO: implement setFeedCallback
+  }
+  
+  @override
+  void start() {
+    // TODO: implement start
+      //  assert(onFeedSamplesCallback != null);
+      // onFeedSamplesCallback!(0);
   }
 }

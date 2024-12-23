@@ -1,10 +1,9 @@
 import 'dart:io';
-import 'dart:async';
 import 'dart:math' as math;
+import 'dart:async';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-
-import 'flutter_pcm_sound_windows.dart';
 
 enum LogLevel {
   none,
@@ -13,75 +12,107 @@ enum LogLevel {
   verbose,
 }
 
+// Apple Documentation: https://developer.apple.com/documentation/avfaudio/avaudiosessioncategory
 enum IosAudioCategory {
-  soloAmbient,
-  ambient,
-  playback,
-  playAndRecord,
+  soloAmbient, // same as ambient, but other apps will be muted. Other apps will be muted.
+  ambient, // same as soloAmbient, but other apps are not muted.
+  playback, // audio will play when phone is locked, like the music app
+  playAndRecord, // audio will play when phone is locked, and can record audio simultaneously.
 }
 
-class FlutterPcmSound {
-  static const MethodChannel _channel = MethodChannel('flutter_pcm_sound/methods');
-  static late final dynamic _platformImplementation = _getPlatformImplementation();
+abstract class FlutterPcmSoundImpl {
+  Future<void> setLogLevel(LogLevel level);
+  Future<void> setup(
+      {required int sampleRate,
+      required int channelCount,
+      IosAudioCategory iosAudioCategory});
+  Future<void> feed(PcmArrayInt16 buffer);
+  Future<void> setFeedThreshold(int threshold);
+  void setFeedCallback(Function(int)? callback);
+  void start();
+  Future<void> release();
+}
+
+class FlutterPcmSoundDelegatingToNative implements FlutterPcmSoundImpl {
+  static const MethodChannel _channel =
+      const MethodChannel('flutter_pcm_sound/methods');
 
   static Function(int)? onFeedSamplesCallback;
 
   static LogLevel _logLevel = LogLevel.standard;
 
-  /// Determines which platform implementation to use
-  static dynamic _getPlatformImplementation() {
-    if (Platform.isWindows) {
-      return FlutterPcmSoundWindows();
-    }
-    return FlutterPcmSound(); // Default to the existing implementation
-  }
-
-  /// Set log level
-  static Future<void> setLogLevel(LogLevel level) async {
+  /// set log level
+  Future<void> setLogLevel(LogLevel level) async {
     _logLevel = level;
-    await _platformImplementation.setLogLevel(level);
+    return await _invokeMethod('setLogLevel', {'log_level': level.index});
   }
 
-  /// Setup audio
-  static Future<void> setup({
-    required int sampleRate,
-    required int channelCount,
-    IosAudioCategory iosAudioCategory = IosAudioCategory.playback,
-  }) async {
-    await _platformImplementation.setup(
-      sampleRate: sampleRate,
-      channelCount: channelCount,
-      iosAudioCategory: iosAudioCategory,
-    );
+  /// setup audio
+  /// 'avAudioCategory' is for iOS only,
+  /// enabled by default on other platforms
+  Future<void> setup(
+      {required int sampleRate,
+      required int channelCount,
+      IosAudioCategory iosAudioCategory = IosAudioCategory.playback}) async {
+    return await _invokeMethod('setup', {
+      'sample_rate': sampleRate,
+      'num_channels': channelCount,
+      'ios_audio_category': iosAudioCategory.name,
+    });
   }
 
-  /// Feed PCM data
-  static Future<void> feed(PcmArrayInt16 buffer) async {
-    await _platformImplementation.feed(buffer.bytes.buffer.asUint8List());
+  /// queue 16-bit samples (little endian)
+  Future<void> feed(PcmArrayInt16 buffer) async {
+    return await _invokeMethod(
+        'feed', {'buffer': buffer.bytes.buffer.asUint8List()});
   }
 
-  /// Set feed threshold
-  static Future<void> setFeedThreshold(int threshold) async {
-    await _platformImplementation.setFeedThreshold(threshold);
+  /// set the threshold at which we call the
+  /// feed callback. i.e. if we have less than X
+  /// queued frames, the feed callback will be invoked
+  Future<void> setFeedThreshold(int threshold) async {
+    return await _invokeMethod(
+        'setFeedThreshold', {'feed_threshold': threshold});
   }
 
-  /// Set feed callback
-  static void setFeedCallback(Function(int)? callback) {
+  /// callback is invoked when the audio buffer
+  /// is in danger of running out of queued samples
+  void setFeedCallback(Function(int)? callback) {
     onFeedSamplesCallback = callback;
     _channel.setMethodCallHandler(_methodCallHandler);
   }
 
-  /// Start callback
-  static void start() {
+  /// convenience function:
+  ///   * invokes your feed callback
+  void start() {
     assert(onFeedSamplesCallback != null);
     onFeedSamplesCallback!(0);
   }
 
-  /// Release resources
-  static Future<void> release() async {
-    await _platformImplementation.release();
+  /// release all audio resources
+  Future<void> release() async {
+    return await _invokeMethod('release');
   }
-  
+
+  static Future<T?> _invokeMethod<T>(String method, [dynamic arguments]) async {
+    if (_logLevel.index >= LogLevel.standard.index) {
+      String args = '';
+      if (method == 'feed') {
+        Uint8List data = arguments['buffer'];
+        if (data.lengthInBytes > 6) {
+          args =
+              '(${data.lengthInBytes ~/ 2} samples) ${data.sublist(0, 6)} ...';
+        } else {
+          args = '(${data.lengthInBytes ~/ 2} samples) $data';
+        }
+      } else if (arguments != null) {
+        args = arguments.toString();
+      }
+      print("[PCM] invoke: $method $args");
+    }
+    return await _channel.invokeMethod(method, arguments);
+  }
+
   static Future<dynamic> _methodCallHandler(MethodCall call) async {
     if (_logLevel.index >= LogLevel.standard.index) {
       String func = '[[ ${call.method} ]]';
@@ -101,6 +132,67 @@ class FlutterPcmSound {
   }
 }
 
+class FlutterPcmSound {
+  static const isWeb = bool.fromEnvironment('dart.library.js_util');
+  static final _impl =
+      isWeb || !Platform.isWindows
+          ? FlutterPcmSoundDelegatingToNative()
+          : FlutterPcmSoundDelegatingToNative();
+
+
+  static Function(int)? onFeedSamplesCallback;
+
+
+  /// set log level
+  static Future<void> setLogLevel(LogLevel level) async {
+    return await _impl.setLogLevel(level);
+  }
+
+  /// setup audio
+  /// 'avAudioCategory' is for iOS only,
+  /// enabled by default on other platforms
+  static Future<void> setup(
+      {required int sampleRate,
+      required int channelCount,
+      IosAudioCategory iosAudioCategory = IosAudioCategory.playback}) async {
+    return await _impl.setup(
+      sampleRate: sampleRate,
+      channelCount: channelCount,
+      iosAudioCategory: iosAudioCategory,
+    );
+  }
+
+  /// queue 16-bit samples (little endian)
+  static Future<void> feed(PcmArrayInt16 buffer) async {
+    return await _impl.feed(buffer);
+  }
+
+  /// set the threshold at which we call the
+  /// feed callback. i.e. if we have less than X
+  /// queued frames, the feed callback will be invoked
+  static Future<void> setFeedThreshold(int threshold) async {
+    return await _impl.setFeedThreshold(threshold);
+  }
+
+  /// callback is invoked when the audio buffer
+  /// is in danger of running out of queued samples
+  static void setFeedCallback(Function(int)? callback) {
+    onFeedSamplesCallback = callback;
+    _impl.setFeedCallback(callback);
+  }
+
+  /// convenience function:
+  ///   * invokes your feed callback
+  static void start() {
+    assert(onFeedSamplesCallback != null);
+    onFeedSamplesCallback!(0);
+  }
+
+  /// release all audio resources
+  static Future<void> release() async {
+    return await _impl.release();
+  }
+}
 
 class PcmArrayInt16 {
   final ByteData bytes;
