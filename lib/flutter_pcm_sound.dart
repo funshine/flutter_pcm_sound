@@ -81,25 +81,7 @@ class FlutterPcmSound {
   static Future<void> release() async {
     await _platformImplementation.release();
   }
-
-  static Future<T?> _invokeMethod<T>(String method, [dynamic arguments]) async {
-    if (_logLevel.index >= LogLevel.standard.index) {
-      String args = '';
-      if (method == 'feed') {
-        Uint8List data = arguments['buffer'];
-        if (data.lengthInBytes > 6) {
-          args = '(${data.lengthInBytes ~/ 2} samples) ${data.sublist(0, 6)} ...';
-        } else {
-          args = '(${data.lengthInBytes ~/ 2} samples) $data';
-        }
-      } else if (arguments != null) {
-        args = arguments.toString();
-      }
-      print("[PCM] invoke: $method $args");
-    }
-    return await _channel.invokeMethod(method, arguments);
-  }
-
+  
   static Future<dynamic> _methodCallHandler(MethodCall call) async {
     if (_logLevel.index >= LogLevel.standard.index) {
       String func = '[[ ${call.method} ]]';

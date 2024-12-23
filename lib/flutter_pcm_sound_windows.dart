@@ -12,16 +12,13 @@ class FlutterPcmSoundWindows {
   IAudioRenderClient? _renderClient;
   
   // Audio configuration
-  int _sampleRate = 44100;
-  int _channelCount = 2;
   int _feedThreshold = 0;
   LogLevel _logLevel = LogLevel.standard;
   
   // Buffer management
   int _bufferFrameCount = 0;
   bool _isInitialized = false;
-  bool _isPlaying = false;
-  Timer? _feedTimer;
+  Timer? _checkTimer;
 
   void _log(String message) {
     if (_logLevel.index >= LogLevel.standard.index) {
@@ -53,15 +50,34 @@ class FlutterPcmSoundWindows {
     }
   }
 
+  Future<void> _checkBuffer() async {
+    if (!_isInitialized || FlutterPcmSound.onFeedSamplesCallback == null) {
+      _checkTimer?.cancel();
+      _checkTimer = null;
+      return;
+    }
+
+    try {
+      final pNumFramesPadding = calloc<UINT32>();
+      check(_audioClient!.getCurrentPadding(pNumFramesPadding), 'Get current padding');
+      final framesInBuffer = pNumFramesPadding.value;
+      free(pNumFramesPadding);
+      
+      if (framesInBuffer <= _feedThreshold) {
+        _logVerbose('Buffer needs more data: $framesInBuffer frames remaining');
+        FlutterPcmSound.onFeedSamplesCallback!(framesInBuffer);
+      }
+    } catch (e) {
+      _logError('Buffer check failed: $e');
+    }
+  }
+
   Future<void> setup({
     required int sampleRate,
     required int channelCount,
     IosAudioCategory iosAudioCategory = IosAudioCategory.playback,
   }) async {
-    try {
-      _sampleRate = sampleRate;
-      _channelCount = channelCount;
-      
+    try {  
       _log('Initializing WASAPI with sample rate: $sampleRate, channels: $channelCount');
       
       // Initialize COM
@@ -91,7 +107,7 @@ class FlutterPcmSoundWindows {
       
       _audioClient = IAudioClient3(ppAudioClient);
       
-      // First get the mix format to understand what the system supports
+      // First get the mix format
       final ppMixFormat = calloc<Pointer<WAVEFORMATEX>>();
       check(_audioClient!.getMixFormat(ppMixFormat), 'Get mix format');
       final pMixFormat = ppMixFormat.value;
@@ -136,7 +152,7 @@ class FlutterPcmSoundWindows {
       }
       
       // Initialize audio client
-      final bufferDuration = 5000 * 10000; // 5 seconds in 100-nanosecond units
+      final bufferDuration = 2000 * 10000; // 2 seconds in 100-nanosecond units
       check(
         _audioClient!.initialize(
           AUDCLNT_SHAREMODE.AUDCLNT_SHAREMODE_SHARED,
@@ -186,21 +202,16 @@ class FlutterPcmSoundWindows {
     }
 
     try {
-      // Start the feed timer if this is our first feed
-      if (!_isPlaying) {
-        _isPlaying = true;
-        _feedTimer?.cancel();
-        _feedTimer = Timer.periodic(Duration(milliseconds: 10), (_) {
-          if (FlutterPcmSound.onFeedSamplesCallback != null) {
-            FlutterPcmSound.onFeedSamplesCallback!(4800); // Request about 100ms worth at 48kHz
-          }
-        });
-      }
+      // Start periodic buffer checks if not already running
+      _checkTimer?.cancel();
+      _checkTimer = Timer.periodic(Duration(milliseconds: 10), (timer) {
+        _checkBuffer();
+      });
 
       final pNumFramesPadding = calloc<UINT32>();
       check(_audioClient!.getCurrentPadding(pNumFramesPadding), 'Get current padding');
-      final numFramesAvailable = _bufferFrameCount - pNumFramesPadding.value;
       final framesInBuffer = pNumFramesPadding.value;
+      final numFramesAvailable = _bufferFrameCount - framesInBuffer;
       free(pNumFramesPadding);
 
       _logVerbose('Buffer status: $framesInBuffer buffered, $numFramesAvailable available');
@@ -241,9 +252,8 @@ class FlutterPcmSoundWindows {
   Future<void> release() async {
     _log('Releasing resources');
     
-    _isPlaying = false;
-    _feedTimer?.cancel();
-    _feedTimer = null;
+    _checkTimer?.cancel();
+    _checkTimer = null;
 
     if (_audioClient != null) {
       try {
@@ -256,7 +266,6 @@ class FlutterPcmSoundWindows {
     _audioClient = null;
     _renderClient = null;
     _isInitialized = false;
-
     _log('Resources released');
   }
 }
