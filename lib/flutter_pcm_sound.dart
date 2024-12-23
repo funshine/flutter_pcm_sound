@@ -1,7 +1,10 @@
-import 'dart:math' as math;
+import 'dart:io';
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:flutter/services.dart';
+
+import 'flutter_pcm_sound_windows.dart';
 
 enum LogLevel {
   none,
@@ -10,70 +13,73 @@ enum LogLevel {
   verbose,
 }
 
-// Apple Documentation: https://developer.apple.com/documentation/avfaudio/avaudiosessioncategory
 enum IosAudioCategory {
-  soloAmbient, // same as ambient, but other apps will be muted. Other apps will be muted.
-  ambient, // same as soloAmbient, but other apps are not muted.
-  playback, // audio will play when phone is locked, like the music app
-  playAndRecord, // audio will play when phone is locked, and can record audio simultaneously.
+  soloAmbient,
+  ambient,
+  playback,
+  playAndRecord,
 }
 
 class FlutterPcmSound {
-  static const MethodChannel _channel = const MethodChannel('flutter_pcm_sound/methods');
+  static const MethodChannel _channel = MethodChannel('flutter_pcm_sound/methods');
+  static late final dynamic _platformImplementation = _getPlatformImplementation();
 
   static Function(int)? onFeedSamplesCallback;
 
   static LogLevel _logLevel = LogLevel.standard;
 
-  /// set log level
+  /// Determines which platform implementation to use
+  static dynamic _getPlatformImplementation() {
+    if (Platform.isWindows) {
+      return FlutterPcmSoundWindows();
+    }
+    return FlutterPcmSound(); // Default to the existing implementation
+  }
+
+  /// Set log level
   static Future<void> setLogLevel(LogLevel level) async {
     _logLevel = level;
-    return await _invokeMethod('setLogLevel', {'log_level': level.index});
+    await _platformImplementation.setLogLevel(level);
   }
 
-  /// setup audio
-  /// 'avAudioCategory' is for iOS only,
-  /// enabled by default on other platforms
-  static Future<void> setup(
-      {required int sampleRate,
-      required int channelCount,
-      IosAudioCategory iosAudioCategory = IosAudioCategory.playback}) async {
-    return await _invokeMethod('setup', {
-      'sample_rate': sampleRate,
-      'num_channels': channelCount,
-      'ios_audio_category': iosAudioCategory.name,
-    });
+  /// Setup audio
+  static Future<void> setup({
+    required int sampleRate,
+    required int channelCount,
+    IosAudioCategory iosAudioCategory = IosAudioCategory.playback,
+  }) async {
+    await _platformImplementation.setup(
+      sampleRate: sampleRate,
+      channelCount: channelCount,
+      iosAudioCategory: iosAudioCategory,
+    );
   }
 
-  /// queue 16-bit samples (little endian)
+  /// Feed PCM data
   static Future<void> feed(PcmArrayInt16 buffer) async {
-    return await _invokeMethod('feed', {'buffer': buffer.bytes.buffer.asUint8List()});
+    await _platformImplementation.feed(buffer.bytes.buffer.asUint8List());
   }
 
-  /// set the threshold at which we call the
-  /// feed callback. i.e. if we have less than X
-  /// queued frames, the feed callback will be invoked
+  /// Set feed threshold
   static Future<void> setFeedThreshold(int threshold) async {
-    return await _invokeMethod('setFeedThreshold', {'feed_threshold': threshold});
+    await _platformImplementation.setFeedThreshold(threshold);
   }
 
-  /// callback is invoked when the audio buffer
-  /// is in danger of running out of queued samples
+  /// Set feed callback
   static void setFeedCallback(Function(int)? callback) {
     onFeedSamplesCallback = callback;
     _channel.setMethodCallHandler(_methodCallHandler);
   }
 
-  /// convenience function:
-  ///   * invokes your feed callback
+  /// Start callback
   static void start() {
     assert(onFeedSamplesCallback != null);
     onFeedSamplesCallback!(0);
   }
 
-  /// release all audio resources
+  /// Release resources
   static Future<void> release() async {
-    return await _invokeMethod('release');
+    await _platformImplementation.release();
   }
 
   static Future<T?> _invokeMethod<T>(String method, [dynamic arguments]) async {
@@ -112,6 +118,7 @@ class FlutterPcmSound {
     }
   }
 }
+
 
 class PcmArrayInt16 {
   final ByteData bytes;

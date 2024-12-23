@@ -47,6 +47,7 @@ class _PcmSoundAppState extends State<PcmSoundApp> {
   }
 
   void _onFeed(int remainingFrames) async {
+    print('onFeed: $remainingFrames');
     setState(() {
       _remainingFrames = remainingFrames;
     });
