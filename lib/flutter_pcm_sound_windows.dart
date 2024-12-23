@@ -14,7 +14,14 @@ class FlutterPcmSoundWindows {
   // Audio configuration
   int _feedThreshold = 0;
   LogLevel _logLevel = LogLevel.standard;
-  
+
+  // System (mix) format after WASAPI init
+  int _finalSampleRate = 0;
+  int _finalChannelCount = 0;
+
+  int _clientSampleRate = 0;
+  int _clientChannelCount = 0;
+
   // Buffer management
   int _bufferFrameCount = 0;
   bool _isInitialized = false;
@@ -77,9 +84,11 @@ class FlutterPcmSoundWindows {
     required int channelCount,
     IosAudioCategory iosAudioCategory = IosAudioCategory.playback,
   }) async {
-    try {  
+    try {
       _log('Initializing WASAPI with sample rate: $sampleRate, channels: $channelCount');
-      
+          _clientSampleRate = sampleRate;
+    _clientChannelCount = channelCount;
+
       // Initialize COM
       check(CoInitializeEx(nullptr, COINIT.COINIT_APARTMENTTHREADED), 'COM initialization');
       
@@ -107,52 +116,65 @@ class FlutterPcmSoundWindows {
       
       _audioClient = IAudioClient3(ppAudioClient);
       
-      // First get the mix format
+      // First get the mix format (system / shared mode format)
       final ppMixFormat = calloc<Pointer<WAVEFORMATEX>>();
       check(_audioClient!.getMixFormat(ppMixFormat), 'Get mix format');
       final pMixFormat = ppMixFormat.value;
-      
-      // Create our format based on the mix format capabilities
+
+      // Store final system format details
+      _finalSampleRate = pMixFormat.ref.nSamplesPerSec;
+      _finalChannelCount = pMixFormat.ref.nChannels;
+
+      _log('System Mix Format: $_finalSampleRate Hz, $_finalChannelCount channels, ${pMixFormat.ref.wBitsPerSample}-bit');
+
+      // Construct a wave format that we’d like to use.
+      // For shared mode, we’re allowed to request something, but the OS may force us to the mix format.
+      // We'll still try for 16-bit with the specified sampleRate/channelCount from the user.
       final pWaveFormat = calloc<WAVEFORMATEX>();
       pWaveFormat.ref
         ..wFormatTag = WAVE_FORMAT_PCM
         ..nChannels = channelCount
         ..nSamplesPerSec = sampleRate
-        ..wBitsPerSample = 16 // Match Int16 from PcmArrayInt16
+        ..wBitsPerSample = 16
         ..nBlockAlign = (16 * channelCount) ~/ 8
         ..nAvgBytesPerSec = sampleRate * ((16 * channelCount) ~/ 8)
         ..cbSize = 0;
 
-      _log('Mix Format: ${pMixFormat.ref.nSamplesPerSec}Hz, ${pMixFormat.ref.nChannels} channels, ${pMixFormat.ref.wBitsPerSample}-bit');
-      _log('Requested Format: ${sampleRate}Hz, $channelCount channels, 16-bit PCM');
-
-      // Check if our format is supported
+      // Check if the requested format is supported
       final pClosestMatch = calloc<Pointer<WAVEFORMATEX>>();
       final hr = _audioClient!.isFormatSupported(
-          AUDCLNT_SHAREMODE.AUDCLNT_SHAREMODE_SHARED,
-          pWaveFormat,
-          pClosestMatch);
-
+        AUDCLNT_SHAREMODE.AUDCLNT_SHAREMODE_SHARED,
+        pWaveFormat,
+        pClosestMatch
+      );
+      
       if (hr == S_OK) {
-        _log('Requested format is supported');
+        _log('Requested format is supported: ${sampleRate}Hz, $channelCount channel(s).');
       } else if (hr == S_FALSE && pClosestMatch.value != nullptr) {
-        _log('Using closest matching format');
         final closest = pClosestMatch.value.ref;
-        _log('Closest Format: ${closest.nSamplesPerSec}Hz, ${closest.nChannels} channels, ${closest.wBitsPerSample}-bit');
-        
-        // Use the closest matching format
+        _log('Requested format not fully supported. Using closest match: '
+             '${closest.nSamplesPerSec}Hz, ${closest.nChannels} channel(s).');
+
+        // Update our wave format struct to the closest match
         pWaveFormat.ref
           ..nSamplesPerSec = closest.nSamplesPerSec
           ..nChannels = closest.nChannels
           ..wBitsPerSample = closest.wBitsPerSample
           ..nBlockAlign = (closest.wBitsPerSample * closest.nChannels) ~/ 8
-          ..nAvgBytesPerSec = closest.nSamplesPerSec * ((closest.wBitsPerSample * closest.nChannels) ~/ 8);
+          ..nAvgBytesPerSec = closest.nSamplesPerSec *
+                              ((closest.wBitsPerSample * closest.nChannels) ~/ 8);
       } else {
         check(hr, 'Format check');
       }
-      
+
+      // Re-check what the final format we’re actually using is (pWaveFormat)
+      _log('Final format for initialization: '
+           '${pWaveFormat.ref.nSamplesPerSec} Hz, '
+           '${pWaveFormat.ref.nChannels} channel(s), '
+           '${pWaveFormat.ref.wBitsPerSample}-bit');
+
       // Initialize audio client
-      final bufferDuration = 2000 * 10000; // 2 seconds in 100-nanosecond units
+      final bufferDuration = 2000 * 10000; // 2 seconds in 100-ns units
       check(
         _audioClient!.initialize(
           AUDCLNT_SHAREMODE.AUDCLNT_SHAREMODE_SHARED,
@@ -164,14 +186,15 @@ class FlutterPcmSoundWindows {
         ),
         'Initialize audio client'
       );
-      
+
       // Get buffer size
       final pBufferFrameCount = calloc<UINT32>();
       check(_audioClient!.getBufferSize(pBufferFrameCount), 'Get buffer size');
       _bufferFrameCount = pBufferFrameCount.value;
-      _log('Buffer frame count: $_bufferFrameCount');
       free(pBufferFrameCount);
-      
+
+      _log('Buffer frame count: $_bufferFrameCount');
+
       // Get render client
       final iidAudioRenderClient = convertToIID(IID_IAudioRenderClient);
       final ppRenderClient = calloc<COMObject>();
@@ -195,16 +218,24 @@ class FlutterPcmSoundWindows {
     }
   }
 
+  /// Feed raw PCM data to WASAPI.
+  ///
+  /// [buffer] is the client’s PCM data in 16-bit, interleaved format.
+  /// [clientSampleRate] is e.g., 24000
+  /// [clientChannels] is e.g., 1 (mono)
   Future<void> feed(Uint8List buffer) async {
     if (!_isInitialized) {
       _logError('Cannot feed: not initialized');
       return;
     }
 
+    int clientSampleRate = _clientSampleRate;
+    int clientChannels = _clientChannelCount;
+
     try {
       // Start periodic buffer checks if not already running
       _checkTimer?.cancel();
-      _checkTimer = Timer.periodic(Duration(milliseconds: 10), (timer) {
+      _checkTimer = Timer.periodic(const Duration(milliseconds: 10), (timer) {
         _checkBuffer();
       });
 
@@ -217,31 +248,129 @@ class FlutterPcmSoundWindows {
       _logVerbose('Buffer status: $framesInBuffer buffered, $numFramesAvailable available');
 
       if (numFramesAvailable > 0) {
-        final pData = calloc<Pointer<BYTE>>();
-        check(_renderClient!.getBuffer(numFramesAvailable, pData), 'Get buffer');
-        
-        final src = buffer.buffer.asInt16List();
-        final framesToCopy = (buffer.lengthInBytes ~/ 2) < numFramesAvailable
-            ? (buffer.lengthInBytes ~/ 2)
+        // Convert incoming buffer to Int16List
+        final inputSamples = buffer.buffer.asInt16List();
+
+        // If client format != final system mix format, resample/upmix
+        final Float32List finalData = _resampleIfNeeded(
+          inputSamples,
+          clientSampleRate,
+          clientChannels,
+          _finalSampleRate,
+          _finalChannelCount
+        );
+
+        final totalFrames = finalData.length ~/ _finalChannelCount; // each frame has `_finalChannelCount` floats
+
+        // Decide how many frames we can copy into WASAPI right now
+        final framesToCopy = totalFrames < numFramesAvailable
+            ? totalFrames
             : numFramesAvailable;
 
-        if (framesToCopy > 0) {
-          final dst = pData.value.cast<Float>();
-          for (var i = 0; i < framesToCopy; i++) {
-            final float = src[i] / 32768.0;
-            dst[i * 2] = float;
-            dst[i * 2 + 1] = float;
-          }
+        // Lock the WASAPI buffer
+        final pData = calloc<Pointer<Float>>();
+        check(_renderClient!.getBuffer(framesToCopy, pData.cast()), 'Get buffer');
 
-          check(_renderClient!.releaseBuffer(framesToCopy, 0), 'Release buffer');
-          _logVerbose('Fed $framesToCopy frames');
-        }
+        // Copy finalData into the WASAPI buffer
+        final dst = pData.value.asTypedList(framesToCopy * _finalChannelCount);
+        dst.setRange(0, framesToCopy * _finalChannelCount, finalData);
+
+        // Release the WASAPI buffer
+        check(_renderClient!.releaseBuffer(framesToCopy, 0), 'Release buffer');
         free(pData);
+
+        _logVerbose('Fed $framesToCopy frames (client: $clientSampleRate Hz, $clientChannels ch)');
       }
     } catch (e) {
       _logError('Feed failed: $e');
       rethrow;
     }
+  }
+
+  /// A minimal up-sampling / up-mixing routine that:
+  /// - If clientSampleRate == finalSampleRate and clientChannels == finalChannels, pass through.
+  /// - Else if (24->48 and 1->2) do a basic linear interpolation upsample (2x) and stereo duplication.
+  /// - Otherwise, also pass through (you can expand logic if you want other ratios).
+  Float32List _resampleIfNeeded(
+    Int16List inputSamples,
+    int inSampleRate,
+    int inChannels,
+    int outSampleRate,
+    int outChannels
+  ) {
+    // If the format matches, just pass through
+    if (inSampleRate == outSampleRate && inChannels == outChannels) {
+      // Convert 16-bit int to float32, because the WASAPI code writes floats
+      final outData = Float32List(inputSamples.length);
+      for (int i = 0; i < inputSamples.length; i++) {
+        outData[i] = inputSamples[i] / 32768.0;
+      }
+      return outData;
+    }
+
+    // For simplicity, handle only the “24 kHz mono → 48 kHz stereo” case
+    // If it’s not that, we’ll just do a direct pass-through (but disclaim it)
+    if (inSampleRate == 24000 && outSampleRate == 48000 &&
+        inChannels == 1 && outChannels == 2) {
+      return _upsample24kTo48kStereo(inputSamples);
+    }
+
+    if (inSampleRate == 48000 && inChannels == 1 && outSampleRate ==48000 && outChannels == 2) {
+      final outData = Float32List(inputSamples.length * 2);
+      for (int i = 0; i < inputSamples.length; i++) {
+        outData[i * 2] = inputSamples[i] / 32768.0;
+        outData[i * 2 + 1] = inputSamples[i] / 32768.0;
+      }
+      return outData;
+    }
+
+    _logError(
+      'Unsupported resampling from $inSampleRate/$inChannels to '
+      '$outSampleRate/$outChannels. Falling back to pass-through; audio may sound incorrect!'
+    );
+
+    // Just pass-through (16-bit → float only)
+    final outData = Float32List(inputSamples.length);
+    for (int i = 0; i < inputSamples.length; i++) {
+      outData[i] = inputSamples[i] / 32768.0;
+    }
+    return outData;
+  }
+
+  /// Simple 2× upsampling (linear interpolation) from 24 kHz mono
+  /// → 48 kHz stereo float32
+  Float32List _upsample24kTo48kStereo(Int16List mono24k) {
+    final inNumFrames = mono24k.length; // each sample is 1 channel
+    final outNumFrames = inNumFrames * 2; // 2× upsample
+    // stereo => 2 channels → total out samples = outNumFrames * 2
+    final out = Float32List(outNumFrames * 2);
+
+    for (int i = 0; i < inNumFrames - 1; i++) {
+      final s1 = mono24k[i] / 32768.0;
+      final s2 = mono24k[i + 1] / 32768.0;
+      final outIndex = i * 4; // each input frame → 2 output frames, 2 channels each = 4 floats
+
+      // first output frame (same as s1, duplicated L+R)
+      out[outIndex]     = s1; // left
+      out[outIndex + 1] = s1; // right
+
+      // second output frame = linear interpolation
+      final mid = (s1 + s2) * 0.5;
+      out[outIndex + 2] = mid; // left
+      out[outIndex + 3] = mid; // right
+    }
+
+    // Handle last sample
+    final sLast = mono24k[inNumFrames - 1] / 32768.0;
+    final lastIndex = (inNumFrames - 1) * 4;
+    // first frame
+    out[lastIndex]     = sLast;
+    out[lastIndex + 1] = sLast;
+    // second frame
+    out[lastIndex + 2] = sLast;
+    out[lastIndex + 3] = sLast;
+
+    return out;
   }
 
   Future<void> setFeedThreshold(int threshold) async {
