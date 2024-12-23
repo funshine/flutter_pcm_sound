@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_pcm_sound/flutter_pcm_sound_windows.dart';
 
 enum LogLevel {
   none,
@@ -137,7 +138,7 @@ class FlutterPcmSound {
   static final _impl =
       isWeb || !Platform.isWindows
           ? FlutterPcmSoundDelegatingToNative()
-          : FlutterPcmSoundDelegatingToNative();
+      : createWindowsImpl();
 
 
   static Function(int)? onFeedSamplesCallback;
@@ -276,7 +277,8 @@ class MajorScale {
     final step = math.pi * 2 / nFramesPerPeriod;
     List<int> data = List.filled(totalFrames, 0);
     for (int i = 0; i < totalFrames; i++) {
-      data[i] = (math.cos(step * (i % nFramesPerPeriod)) * volume * 32768).toInt() - 16384;
+data[i] =
+          (math.cos(step * (i % nFramesPerPeriod)) * volume * 32767).toInt();
     }
     return data;
   }
