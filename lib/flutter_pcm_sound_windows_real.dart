@@ -19,8 +19,9 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
 
   // Client format (what the app provides)
   int _clientSampleRate = 0;
-
-  // Final format (what the system wants)
+  int _clientChannelCount = 0;
+  
+  // System format (what WASAPI wants)
   int _finalSampleRate = 0;
 
   // Buffer management
@@ -90,6 +91,7 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
     try {
       _log('Initializing WASAPI with sample rate: $sampleRate, channels: $channelCount');
       _clientSampleRate = sampleRate;
+      _clientChannelCount = channelCount;
 
       // Initialize COM
       check(CoInitializeEx(nullptr, COINIT.COINIT_APARTMENTTHREADED),
@@ -132,8 +134,11 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
       check(_audioClient!.getMixFormat(ppMixFormat), 'Get mix format');
       final pMixFormat = ppMixFormat.value;
       
-      _log('System Mix Format: ${pMixFormat.ref.nSamplesPerSec} Hz, ${pMixFormat.ref.nChannels} channels, ${pMixFormat.ref.wBitsPerSample}-bit');
+      // Store system format for potential upsampling later
       _finalSampleRate = pMixFormat.ref.nSamplesPerSec;
+      
+      _log('System Mix Format: ${pMixFormat.ref.nSamplesPerSec} Hz, ${pMixFormat.ref.nChannels} channels, ${pMixFormat.ref.wBitsPerSample}-bit');
+
       // Construct our desired wave format
       final pWaveFormat = calloc<WAVEFORMATEX>();
       pWaveFormat.ref
@@ -202,10 +207,6 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
       // Clean up format allocations
       CoTaskMemFree(ppMixFormat.value.cast());
       free(ppMixFormat);
-      if (pClosestMatch.value != nullptr) {
-        CoTaskMemFree(pClosestMatch.value.cast());
-      }
-      free(pClosestMatch);
       free(pWaveFormat);
 
       _isInitialized = true;
@@ -241,7 +242,7 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
           'Buffer status: $framesInBuffer buffered, $numFramesAvailable available');
 
       if (numFramesAvailable > 0) {
-        // Convert incoming buffer to Float32List
+        // Convert incoming buffer to Int16List
         final inputSamples = buffer.bytes.buffer.asInt16List();
         
         // Handle 24kHz -> 48kHz upsampling if needed
@@ -266,7 +267,7 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
         
         // Convert and duplicate mono samples to stereo
         for (int i = 0; i < inputFrames; i++) {
-          final float = inputSamples[i] / 32768.0;
+          final float = upsampledData[i] / 32768.0;
           finalData[i * 2] = float;     // Left channel
           finalData[i * 2 + 1] = float; // Right channel
         }
