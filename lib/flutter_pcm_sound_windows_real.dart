@@ -359,7 +359,8 @@ _log('First 10 samples after copy: ${dst.take(10).toList()}');
   /// Simple 2× upsampling (linear interpolation) from 24 kHz mono
   /// → 48 kHz stereo float32
   Float32List _upsample24kTo48kStereo(Int16List mono24k) {
-    print('upsample24kTo48kStereo');
+    print(
+        'upsample24kTo48kStereo. First 10 samples: ${mono24k.take(10).toList()}');
     final inNumFrames = mono24k.length; // each sample is 1 channel
     final outNumFrames = inNumFrames * 2; // 2× upsample
     // stereo => 2 channels → total out samples = outNumFrames * 2
@@ -376,8 +377,8 @@ _log('First 10 samples after copy: ${dst.take(10).toList()}');
 
       // second output frame = linear interpolation
       final mid = (s1 + s2) * 0.5;
-      out[outIndex + 2] = mid; // left
-      out[outIndex + 3] = mid; // right
+      out[outIndex + 2] = s1; // left
+      out[outIndex + 3] = s1; // right
     }
 
     // Handle last sample
@@ -390,6 +391,8 @@ _log('First 10 samples after copy: ${dst.take(10).toList()}');
     out[lastIndex + 2] = sLast;
     out[lastIndex + 3] = sLast;
 
+    print(
+        'upsample24kTo48kStereo. First 20 samples after upsample: ${out.take(20).toList()}');
     return out;
   }
 
