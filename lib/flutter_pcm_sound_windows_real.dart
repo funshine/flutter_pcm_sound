@@ -19,7 +19,9 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
 
   // Client format (what the app provides)
   int _clientSampleRate = 0;
-  int _clientChannelCount = 0;
+
+  // Final format (what the system wants)
+  int _finalSampleRate = 0;
 
   // Buffer management
   int _bufferFrameCount = 0;
@@ -88,7 +90,6 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
     try {
       _log('Initializing WASAPI with sample rate: $sampleRate, channels: $channelCount');
       _clientSampleRate = sampleRate;
-      _clientChannelCount = channelCount;
 
       // Initialize COM
       check(CoInitializeEx(nullptr, COINIT.COINIT_APARTMENTTHREADED),
@@ -132,7 +133,7 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
       final pMixFormat = ppMixFormat.value;
       
       _log('System Mix Format: ${pMixFormat.ref.nSamplesPerSec} Hz, ${pMixFormat.ref.nChannels} channels, ${pMixFormat.ref.wBitsPerSample}-bit');
-
+      _finalSampleRate = pMixFormat.ref.nSamplesPerSec;
       // Construct our desired wave format
       final pWaveFormat = calloc<WAVEFORMATEX>();
       pWaveFormat.ref
@@ -243,8 +244,21 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
         // Convert incoming buffer to Float32List
         final inputSamples = buffer.bytes.buffer.asInt16List();
         
+        // Handle 24kHz -> 48kHz upsampling if needed
+        Int16List upsampledData;
+        if (_clientSampleRate == 24000 && _finalSampleRate == 48000) {
+          // Simple 2x upsampling - each sample becomes two samples
+          upsampledData = Int16List(inputSamples.length * 2);
+          for (int i = 0; i < inputSamples.length; i++) {
+            upsampledData[i * 2] = inputSamples[i];
+            upsampledData[i * 2 + 1] = inputSamples[i];
+          }
+        } else {
+          upsampledData = inputSamples;
+        }
+        
         // Calculate frame counts based on input mono data
-        final inputFrames = inputSamples.length; // Each mono sample is one frame
+        final inputFrames = upsampledData.length; // Each mono sample is one frame
         final outputFrames = inputFrames; // Same number of frames, but stereo
         
         // Create output buffer with space for stereo data
