@@ -28,6 +28,8 @@ flutter:
         pluginClass: FlutterPcmSoundPlugin
       windows:
         dartPluginClass: FlutterPcmSoundWindows
+      linux:
+        pluginClass: FlutterPcmSoundPlugin
       web:
         pluginClass: FlutterPcmSoundPlugin
         fileName: web/flutter_pcm_sound_web.dart
