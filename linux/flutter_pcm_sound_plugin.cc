@@ -4,6 +4,11 @@
 #include <gtk/gtk.h>
 #include <sys/utsname.h>
 #include <alsa/asoundlib.h>
+#include <thread>
+#include <mutex>
+#include <vector>
+#include <algorithm>
+#include <chrono>
 
 
 #include <cstring>
@@ -21,6 +26,12 @@ struct _FlutterPcmSoundPlugin {
  int sample_rate;
  int channels;
  FlMethodChannel* channel;
+ int feed_threshold;
+ bool did_invoke_feed_callback;
+ std::vector<uint8_t> samples;
+ std::mutex samples_mutex;
+ bool should_stop;
+ std::thread* playback_thread;
 };
 
 G_DEFINE_TYPE(FlutterPcmSoundPlugin, flutter_pcm_sound_plugin, g_object_get_type())
@@ -69,35 +80,43 @@ static FlMethodResponse* setup_alsa(FlutterPcmSoundPlugin* self, FlValue* args) 
 }
 
 static FlMethodResponse* feed_alsa(FlutterPcmSoundPlugin* self, FlValue* args) {
- if (!self->handle) return FL_METHOD_RESPONSE(fl_method_error_response_new("NOT_INITIALIZED", "ALSA not initialized", nullptr));
+  if (!self->handle) return FL_METHOD_RESPONSE(fl_method_error_response_new("NOT_INITIALIZED", "ALSA not initialized", nullptr));
 
- FlValue* buffer = fl_value_lookup_string(args, "buffer");
- const uint8_t* data = fl_value_get_uint8_list(buffer);
- size_t length = fl_value_get_length(buffer);
- 
- snd_pcm_sframes_t frames = snd_pcm_writei(self->handle, data, length / (2 * self->channels));
- if (frames < 0) {
-   frames = snd_pcm_recover(self->handle, frames, 0);
-   if (frames < 0) {
-     return FL_METHOD_RESPONSE(fl_method_error_response_new("WRITE_ERROR", snd_strerror(frames), nullptr));
-   }
-   frames = snd_pcm_writei(self->handle, data, length / (2 * self->channels));
- }
+  FlValue* buffer = fl_value_lookup_string(args, "buffer");
+  const uint8_t* data = fl_value_get_uint8_list(buffer);
+  size_t length = fl_value_get_length(buffer);
 
- if (self->channel) {
-  g_autoptr(FlValue) map = fl_value_new_map();
-  fl_value_set_string_take(map, "remaining_frames", fl_value_new_int(0)); // Calculate actual remaining
-  fl_method_channel_invoke_method(self->channel, "OnFeedSamples", map, NULL, NULL, NULL);
-}
+  {
+    std::lock_guard<std::mutex> lock(self->samples_mutex);
+    self->samples.insert(self->samples.end(), data, data + length);
+    self->did_invoke_feed_callback = false;
+  }
 
- return FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_int(frames)));
+  if (!self->playback_thread) {
+    self->should_stop = false;
+    self->playback_thread = new std::thread(playback_thread_func, self);
+  }
+
+  return FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
 }
 
 static FlMethodResponse* release_alsa(FlutterPcmSoundPlugin* self) {
  if (self->handle) {
+   if (self->playback_thread) {
+     self->should_stop = true;
+     self->playback_thread->join();
+     delete self->playback_thread;
+     self->playback_thread = nullptr;
+   }
+
    snd_pcm_drain(self->handle);
    snd_pcm_close(self->handle);
    self->handle = NULL;
+
+   {
+     std::lock_guard<std::mutex> lock(self->samples_mutex);
+     self->samples.clear();
+   }
  }
  return FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
 }
@@ -112,7 +131,13 @@ static void flutter_pcm_sound_plugin_handle_method_call(
 if (strcmp(method, "setLogLevel") == 0) {
   response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
 } else if (strcmp(method, "setFeedThreshold") == 0) {
-  response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
+  FlValue* threshold_value = fl_value_lookup_string(args, "feed_threshold");
+  if (!threshold_value) {
+    response = FL_METHOD_RESPONSE(fl_method_error_response_new("INVALID_ARGS", "feed_threshold required", nullptr));
+  } else {
+    self->feed_threshold = fl_value_get_int(threshold_value);
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
+  }
 } else if (strcmp(method, "setup") == 0) {
    response = setup_alsa(self, args);
  } else if (strcmp(method, "feed") == 0) {
@@ -139,8 +164,54 @@ static void flutter_pcm_sound_plugin_class_init(FlutterPcmSoundPluginClass* klas
  G_OBJECT_CLASS(klass)->dispose = flutter_pcm_sound_plugin_dispose;
 }
 
+static void playback_thread_func(FlutterPcmSoundPlugin* self) {
+  const int chunk_size = 200 * self->channels * 2;
+
+  while (!self->should_stop) {
+    std::vector<uint8_t> chunk;
+    size_t remaining_frames;
+    
+    {
+      std::lock_guard<std::mutex> lock(self->samples_mutex);
+      if (self->samples.empty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
+      }
+
+      size_t bytes_to_take = std::min(chunk_size, (int)self->samples.size());
+      chunk.assign(self->samples.begin(), self->samples.begin() + bytes_to_take);
+      self->samples.erase(self->samples.begin(), self->samples.begin() + bytes_to_take);
+      
+      remaining_frames = self->samples.size() / (self->channels * 2);
+    }
+
+    snd_pcm_sframes_t frames = snd_pcm_writei(self->handle, chunk.data(), chunk.size() / (self->channels * 2));
+    if (frames < 0) {
+      frames = snd_pcm_recover(self->handle, frames, 0);
+      if (frames < 0) continue;
+      frames = snd_pcm_writei(self->handle, chunk.data(), chunk.size() / (self->channels * 2));
+    }
+
+    if (remaining_frames <= self->feed_threshold && !self->did_invoke_feed_callback) {
+      self->did_invoke_feed_callback = true;
+      
+      g_idle_add([](gpointer user_data) -> gboolean {
+        auto* self = static_cast<FlutterPcmSoundPlugin*>(user_data);
+        g_autoptr(FlValue) map = fl_value_new_map();
+        fl_value_set_string_take(map, "remaining_frames", fl_value_new_int(remaining_frames));
+        fl_method_channel_invoke_method(self->channel, "OnFeedSamples", map, NULL, NULL, NULL);
+        return G_SOURCE_REMOVE;
+      }, self);
+    }
+  }
+}
+
 static void flutter_pcm_sound_plugin_init(FlutterPcmSoundPlugin* self) {
- self->handle = NULL;
+  self->handle = NULL;
+  self->feed_threshold = 8000;
+  self->did_invoke_feed_callback = false;
+  self->should_stop = false;
+  self->playback_thread = nullptr;
 }
 
 static void method_call_cb(FlMethodChannel* channel, FlMethodCall* method_call,
