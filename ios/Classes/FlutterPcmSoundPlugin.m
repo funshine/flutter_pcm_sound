@@ -314,13 +314,15 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     }
 
     if (isEarpiece) {
-        NSError *error = nil;
-        [[AVAudioSession sharedInstance] overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&error];
-        if (error) {
-            NSLog(@"Error overriding to speaker: %@", error);
-        } else {
-            NSLog(@"Earpiece was selected, overriding to speaker.");
-        }
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            NSError *error = nil;
+            [[AVAudioSession sharedInstance] overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&error];
+            if (error) {
+                NSLog(@"Error overriding to speaker: %@", error);
+            } else {
+                NSLog(@"Earpiece was selected, overriding to speaker.");
+            }
+        });
     } else {
         // If not using earpiece, do nothing. Headphones, AirPlay, etc. will remain as is.
         // Also, if previously overridden, we can revert if desired:
