@@ -1,0 +1,483 @@
+#include "include/flutter_pcm_sound/flutter_pcm_sound_plugin.h"
+
+#include <flutter_linux/flutter_linux.h>
+#include <gtk/gtk.h>
+#include <sys/utsname.h>
+#include <alsa/asoundlib.h>
+
+
+#include <cstring>
+
+#include "flutter_pcm_sound_plugin_private.h"
+
+#define FLUTTER_PCM_SOUND_PLUGIN(obj) \
+  (G_TYPE_CHECK_INSTANCE_CAST((obj), flutter_pcm_sound_plugin_get_type(), \
+                             FlutterPcmSoundPlugin))
+
+// Configuration constants
+#define DEFAULT_BUFFER_TIME 50000  // 50ms in microseconds
+#define DEFAULT_PERIOD_TIME 10000  // 10ms in microseconds
+#define MAX_SAMPLE_RATE 192000
+#define MIN_SAMPLE_RATE 8000
+#define MAX_CHANNELS 8
+#define MIN_CHANNELS 1
+
+struct FrameData {
+    snd_pcm_sframes_t frames;
+    FlutterPcmSoundPlugin* plugin;
+};
+
+
+struct _FlutterPcmSoundPlugin {
+  GObject parent_instance;
+  
+  // ALSA
+  snd_pcm_t* handle;
+  int sample_rate;
+  int channels;
+  snd_pcm_uframes_t buffer_size;
+  snd_pcm_uframes_t period_size;
+  
+  // Flutter
+  FlMethodChannel* channel;
+  
+  // Buffer monitoring
+  snd_pcm_uframes_t feed_threshold;
+  gboolean feed_callback_triggered;
+ // Just these thread-related members
+  GThread* monitoring_thread;
+  gboolean should_stop_monitoring;
+  GMutex mutex;
+};
+
+G_DEFINE_TYPE(FlutterPcmSoundPlugin, flutter_pcm_sound_plugin, g_object_get_type())
+
+// Forward declarations
+static void start_monitoring_thread(FlutterPcmSoundPlugin* self);
+static void stop_monitoring_thread(FlutterPcmSoundPlugin* self);
+static FlMethodResponse* handle_alsa_error(int err, const char* operation);
+
+static gboolean send_feed_callback(gpointer user_data) {
+    FlutterPcmSoundPlugin* plugin = FLUTTER_PCM_SOUND_PLUGIN(user_data);
+    g_autoptr(FlValue) map = fl_value_new_map();
+    fl_value_set_string_take(map, "remaining_frames", fl_value_new_int(0));  // We can update this with actual frames later
+    fl_method_channel_invoke_method(plugin->channel, "OnFeedSamples", map, NULL, NULL, NULL);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer monitor_buffer(gpointer data) {
+  FlutterPcmSoundPlugin* self = FLUTTER_PCM_SOUND_PLUGIN(data);
+  
+  while (!self->should_stop_monitoring) {
+    g_mutex_lock(&self->mutex);
+    
+    if (self->handle != NULL) {
+      snd_pcm_sframes_t avail = snd_pcm_avail_update(self->handle);
+      if (avail >= 0) { // Only process if no error
+        if (avail <= self->feed_threshold && !self->feed_callback_triggered) {
+          self->feed_callback_triggered = TRUE;
+          
+          // Simple callback
+          g_main_context_invoke(NULL, 
+            send_feed_callback,  // The simple callback function we had before
+            self);
+        }
+      }
+    }
+    
+    g_mutex_unlock(&self->mutex);
+    g_usleep(10000); // 10ms sleep
+  }
+  
+  return NULL;
+}
+
+static void start_monitoring_thread(FlutterPcmSoundPlugin* self) {
+  g_mutex_init(&self->mutex);
+  self->should_stop_monitoring = FALSE;
+  self->monitoring_thread = g_thread_new("pcm-monitor", monitor_buffer, self);
+}
+
+static void stop_monitoring_thread(FlutterPcmSoundPlugin* self) {
+  if (self->monitoring_thread) {
+    self->should_stop_monitoring = TRUE;
+    g_thread_join(self->monitoring_thread);
+    self->monitoring_thread = NULL;
+    g_mutex_clear(&self->mutex);
+  }
+}
+static FlMethodResponse* handle_alsa_error(int err, const char* operation) {
+  g_autofree gchar* message = g_strdup_printf("%s failed: %s", 
+                                             operation, snd_strerror(err));
+  return FL_METHOD_RESPONSE(fl_method_error_response_new("ALSA_ERROR", 
+                                                       message, NULL));
+}
+
+static FlMethodResponse* setup_alsa(FlutterPcmSoundPlugin* self, FlValue* args) {
+  // Validate arguments
+  FlValue* sample_rate_value = fl_value_lookup_string(args, "sample_rate");
+  FlValue* channel_value = fl_value_lookup_string(args, "num_channels");
+  
+  if (!sample_rate_value || !channel_value) {
+    return FL_METHOD_RESPONSE(fl_method_error_response_new(
+      "INVALID_ARGUMENTS",
+      "Missing sample_rate or num_channels",
+      NULL));
+  }
+  
+  int sample_rate = fl_value_get_int(sample_rate_value);
+  int channels = fl_value_get_int(channel_value);
+  
+  // Validate ranges
+  if (sample_rate < MIN_SAMPLE_RATE || sample_rate > MAX_SAMPLE_RATE) {
+    return FL_METHOD_RESPONSE(fl_method_error_response_new(
+      "INVALID_SAMPLE_RATE",
+      "Sample rate out of valid range",
+      NULL));
+  }
+  
+  if (channels < MIN_CHANNELS || channels > MAX_CHANNELS) {
+    return FL_METHOD_RESPONSE(fl_method_error_response_new(
+      "INVALID_CHANNELS",
+      "Channel count out of valid range",
+      NULL));
+  }
+  
+  // Store configuration
+  self->sample_rate = sample_rate;
+  self->channels = channels;
+  
+  // Open PCM device
+  int err = snd_pcm_open(&self->handle, "default", 
+                        SND_PCM_STREAM_PLAYBACK, 0);
+  if (err < 0) return handle_alsa_error(err, "snd_pcm_open");
+  
+  // Configure hardware parameters
+  snd_pcm_hw_params_t* hw_params;
+  snd_pcm_hw_params_alloca(&hw_params);
+  
+  err = snd_pcm_hw_params_any(self->handle, hw_params);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_hw_params_any");
+  }
+  
+  // Set access type
+  err = snd_pcm_hw_params_set_access(self->handle, hw_params,
+                                    SND_PCM_ACCESS_RW_INTERLEAVED);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_hw_params_set_access");
+  }
+  
+  // Set sample format
+  err = snd_pcm_hw_params_set_format(self->handle, hw_params,
+                                    SND_PCM_FORMAT_S16_LE);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_hw_params_set_format");
+  }
+  
+  // Set channel count
+  err = snd_pcm_hw_params_set_channels(self->handle, hw_params, channels);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_hw_params_set_channels");
+  }
+  
+  // Set sample rate
+  unsigned int actual_rate = sample_rate;
+  err = snd_pcm_hw_params_set_rate_near(self->handle, hw_params, 
+                                       &actual_rate, 0);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_hw_params_set_rate_near");
+  }
+  
+  if (actual_rate != (unsigned int)sample_rate) {
+    g_warning("Actual rate %d differs from requested rate %d", 
+              actual_rate, sample_rate);
+  }
+  
+  // Set buffer and period times
+  unsigned int buffer_time = DEFAULT_BUFFER_TIME;
+  unsigned int period_time = DEFAULT_PERIOD_TIME;
+  
+  err = snd_pcm_hw_params_set_buffer_time_near(self->handle, hw_params,
+                                              &buffer_time, 0);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_hw_params_set_buffer_time_near");
+  }
+  
+  err = snd_pcm_hw_params_set_period_time_near(self->handle, hw_params,
+                                              &period_time, 0);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_hw_params_set_period_time_near");
+  }
+  
+  // Apply hardware parameters
+  err = snd_pcm_hw_params(self->handle, hw_params);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_hw_params");
+  }
+  
+  // Get actual buffer and period sizes
+  snd_pcm_hw_params_get_buffer_size(hw_params, &self->buffer_size);
+  snd_pcm_hw_params_get_period_size(hw_params, &self->period_size, 0);
+  
+  // Configure software parameters
+  snd_pcm_sw_params_t* sw_params;
+  snd_pcm_sw_params_alloca(&sw_params);
+  
+  err = snd_pcm_sw_params_current(self->handle, sw_params);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_sw_params_current");
+  }
+  
+  // Start threshold
+  err = snd_pcm_sw_params_set_start_threshold(self->handle, sw_params,
+                                             self->buffer_size / 2);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_sw_params_set_start_threshold");
+  }
+  
+  // Available minimum
+  err = snd_pcm_sw_params_set_avail_min(self->handle, sw_params,
+                                       self->period_size);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_sw_params_set_avail_min");
+  }
+  
+  // Apply software parameters
+  err = snd_pcm_sw_params(self->handle, sw_params);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_sw_params");
+  }
+  
+  // Prepare PCM for use
+  err = snd_pcm_prepare(self->handle);
+  if (err < 0) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+    return handle_alsa_error(err, "snd_pcm_prepare");
+  }
+  
+  printf("ALSA setup complete. Starting monitoring thread\n");
+  // Start monitoring thread
+  if (false) {
+  start_monitoring_thread(self);
+  }
+  printf("Monitoring thread started\n");
+  
+  return FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(TRUE)));
+}
+
+static FlMethodResponse* feed_alsa(FlutterPcmSoundPlugin* self, FlValue* args) {
+  if (!self->handle) {
+    return FL_METHOD_RESPONSE(fl_method_error_response_new(
+      "NOT_INITIALIZED",
+      "ALSA not initialized",
+      NULL));
+  }
+  
+  FlValue* buffer_value = fl_value_lookup_string(args, "buffer");
+  if (!buffer_value) {
+    return FL_METHOD_RESPONSE(fl_method_error_response_new(
+      "INVALID_ARGUMENTS",
+      "Missing buffer",
+      NULL));
+  }
+  
+  const uint8_t* data = fl_value_get_uint8_list(buffer_value);
+  size_t length = fl_value_get_length(buffer_value);
+  
+  if (length == 0) {
+    return FL_METHOD_RESPONSE(fl_method_error_response_new(
+      "INVALID_ARGUMENTS",
+      "Empty buffer",
+      NULL));
+  }
+  
+  // Calculate frame count (16-bit samples)
+  size_t frames = length / (2 * self->channels);
+  size_t frames_written = 0;
+  
+  // Reset feed callback trigger
+  self->feed_callback_triggered = FALSE;
+  
+  while (frames_written < frames) {
+    // Check available space
+    snd_pcm_sframes_t avail = snd_pcm_avail_update(self->handle);
+    if (avail < 0) {
+      // Try to recover from error
+      avail = snd_pcm_recover(self->handle, avail, 0);
+      if (avail < 0) {
+        return handle_alsa_error(avail, "snd_pcm_avail_update");
+      }
+      continue;
+    }
+    
+    // Calculate how many frames to write in this iteration
+    size_t frames_to_write = frames - frames_written;
+    if ((snd_pcm_sframes_t)frames_to_write > avail) {
+      frames_to_write = avail;
+    }
+    
+    if (frames_to_write == 0) {
+      // Wait for more space
+      snd_pcm_wait(self->handle, 100); // 100ms timeout
+      continue;
+    }
+    
+    // Calculate buffer position
+    const uint8_t* write_ptr = data + (frames_written * 2 * self->channels);
+    
+    // Write frames
+    snd_pcm_sframes_t written = snd_pcm_writei(self->handle, write_ptr, frames_to_write);
+    
+    if (written < 0) {
+      // Try to recover from error
+      written = snd_pcm_recover(self->handle, written, 0);
+      if (written < 0) {
+        return handle_alsa_error(written, "snd_pcm_writei");
+      }
+      continue;
+    }
+    
+    frames_written += written;
+  }
+  
+  return FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_int(frames_written)));
+}
+
+static FlMethodResponse* set_feed_threshold(FlutterPcmSoundPlugin* self, FlValue* args) {
+  printf("Setting feed threshold\n");
+  FlValue* threshold_value = fl_value_lookup_string(args, "feed_threshold");
+  if (!threshold_value) {
+    return FL_METHOD_RESPONSE(fl_method_error_response_new(
+      "INVALID_ARGUMENTS",
+      "Missing feed_threshold",
+      NULL));
+  }
+  
+  self->feed_threshold = fl_value_get_int(threshold_value);
+  printf("Feed threshold set\n");
+  return FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(TRUE)));
+}
+
+static FlMethodResponse* release_alsa(FlutterPcmSoundPlugin* self) {
+  // Stop monitoring thread
+  stop_monitoring_thread(self);
+  
+  if (self->handle) {
+    snd_pcm_drain(self->handle);
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+  }
+  
+  return FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(TRUE)));
+}
+
+static void flutter_pcm_sound_plugin_dispose(GObject* object) {
+  FlutterPcmSoundPlugin* self = FLUTTER_PCM_SOUND_PLUGIN(object);
+  
+  // Cleanup ALSA
+  if (self->handle) {
+    snd_pcm_close(self->handle);
+    self->handle = NULL;
+  }
+  
+  // Stop monitoring thread
+  stop_monitoring_thread(self);
+  
+  // Cleanup synchronization primitives
+  g_mutex_clear(&self->mutex);
+  
+  if (self->channel) {
+    g_object_unref(self->channel);
+    self->channel = NULL;
+  }
+  
+  G_OBJECT_CLASS(flutter_pcm_sound_plugin_parent_class)->dispose(object);
+}
+
+static void flutter_pcm_sound_plugin_class_init(FlutterPcmSoundPluginClass* klass) {
+  G_OBJECT_CLASS(klass)->dispose = flutter_pcm_sound_plugin_dispose;
+}
+
+static void flutter_pcm_sound_plugin_init(FlutterPcmSoundPlugin* self) {
+  self->handle = NULL;
+  self->channel = NULL;
+  self->monitoring_thread = NULL;
+  self->feed_threshold = 8000; // Default threshold
+  self->feed_callback_triggered = FALSE;
+  self->should_stop_monitoring = FALSE;
+  
+    g_mutex_init(&self->mutex);  // Just initializing the one mutex we need
+
+}
+
+static void method_call_cb(FlMethodChannel* channel,
+                          FlMethodCall* method_call,
+                          gpointer user_data) {
+  FlutterPcmSoundPlugin* self = FLUTTER_PCM_SOUND_PLUGIN(user_data);
+  
+  const gchar* method = fl_method_call_get_name(method_call);
+  FlValue* args = fl_method_call_get_args(method_call);
+  
+  g_autoptr(FlMethodResponse) response = NULL;
+  printf("method_call_cb: %s\n", method);
+  if (strcmp(method, "setLogLevel") == 0) {
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(TRUE)));
+  } else if (strcmp(method, "setup") == 0) {
+    response = setup_alsa(self, args);
+  } else if (strcmp(method, "feed") == 0) {
+    response = feed_alsa(self, args);
+  } else if (strcmp(method, "setFeedThreshold") == 0) {
+    response = set_feed_threshold(self, args);
+  } else if (strcmp(method, "release") == 0) {
+    response = release_alsa(self);
+  } else {
+    response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
+  }
+  
+  fl_method_call_respond(method_call, response, NULL);
+}
+
+void flutter_pcm_sound_plugin_register_with_registrar(FlPluginRegistrar* registrar) {
+  FlutterPcmSoundPlugin* plugin = FLUTTER_PCM_SOUND_PLUGIN(
+    g_object_new(flutter_pcm_sound_plugin_get_type(), NULL));
+    
+  g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
+  g_autoptr(FlMethodChannel) channel = fl_method_channel_new(
+    fl_plugin_registrar_get_messenger(registrar),
+    "flutter_pcm_sound/methods",
+    FL_METHOD_CODEC(codec));
+    
+  fl_method_channel_set_method_call_handler(channel,
+                                          method_call_cb,
+                                          g_object_ref(plugin),
+                                          g_object_unref);
+                                          
+  plugin->channel = g_object_ref(channel);
+  g_object_unref(plugin);
+}
