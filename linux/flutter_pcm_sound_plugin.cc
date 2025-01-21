@@ -343,7 +343,7 @@ void flutter_pcm_sound_plugin_register_with_registrar(FlPluginRegistrar* registr
  fl_method_channel_set_method_call_handler(channel, method_call_cb,
                                          g_object_ref(plugin),
                                          g_object_unref);
-plugin->channel = g_object_ref(channel);
+ plugin->channel = FL_METHOD_CHANNEL(g_object_ref(channel));
 
  g_object_unref(plugin);
 }
