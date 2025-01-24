@@ -178,7 +178,8 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
         nullptr,
         nullptr,
         0,
-        EVENT_ALL_ACCESS
+        // https://learn.microsoft.com/en-us/windows/win32/sync/synchronization-object-security-and-access-rights
+        0x1F0003 /* EVENT_ALL_ACCESS */, 
       );
       if (_eventHandle == 0) {
         throw WindowsException(HRESULT_FROM_WIN32(GetLastError()));
@@ -240,7 +241,8 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
   void _startEventHandling() {
     _eventSubscription = Stream.periodic(const Duration(milliseconds: 1)).listen((_) async {
       final result = WaitForSingleObject(_eventHandle!, 0);
-      if (result == WAIT_OBJECT_0) {
+      // WAIT_OBJECT_0 == 0x00000000L
+      if (result == 0) {
         await _handleAudioEvent();
       }
     });
