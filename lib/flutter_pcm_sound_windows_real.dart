@@ -27,8 +27,9 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
   // Buffer management
   int _bufferFrameCount = 0;
   bool _isInitialized = false;
-  Timer? _checkTimer;
-
+  int? _eventHandle;
+  StreamSubscription? _eventSubscription;
+  
   void _log(String message) {
     if (_logLevel.index >= LogLevel.standard.index) {
       print('[PCM Windows] $message');
@@ -60,13 +61,12 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
     }
   }
 
-  Future<void> _checkBuffer() async {
+  Future<void> _handleAudioEvent() async {
     if (!_isInitialized || FlutterPcmSound.onFeedSamplesCallback == null) {
-      _checkTimer?.cancel();
-      _checkTimer = null;
+      await _stopEventHandling();
       return;
     }
-
+  
     try {
       final pNumFramesPadding = calloc<UINT32>();
       check(_audioClient!.getCurrentPadding(pNumFramesPadding),
@@ -173,16 +173,35 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
         formatToUse = pMixFormat;
       }
 
-      // Initialize audio client with format conversion
+      // Create event handle for notifications
+      _eventHandle = CreateEventEx(
+        nullptr,
+        nullptr,
+        0,
+        EVENT_ALL_ACCESS
+      );
+      if (_eventHandle == 0) {
+        throw WindowsException(HRESULT_FROM_WIN32(GetLastError()));
+      }
+
+      // Initialize audio client with event notifications
       final bufferDuration = 2000 * 10000; // 2 seconds in 100-ns units
       check(
-          _audioClient!.initialize(AUDCLNT_SHAREMODE.AUDCLNT_SHAREMODE_SHARED,
-              0x80000000 | 0x08000000, // AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
-              bufferDuration, 
-              0, 
-              formatToUse, 
+          _audioClient!.initialize(
+              AUDCLNT_SHAREMODE.AUDCLNT_SHAREMODE_SHARED,
+              0x80000000 | 0x08000000 | 0x00040000, // Add AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+              bufferDuration,
+              0,
+              formatToUse,
               nullptr),
           'Initialize audio client');
+
+      // Set the event handle
+      check(_audioClient!.setEventHandle(_eventHandle!),
+          'Set event handle');
+
+      // Start listening for events
+      _startEventHandling();
 
       // Get buffer size
       final pBufferFrameCount = calloc<UINT32>();
@@ -218,18 +237,31 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
     }
   }
 
+  void _startEventHandling() {
+    _eventSubscription = Stream.periodic(const Duration(milliseconds: 1)).listen((_) async {
+      final result = WaitForSingleObject(_eventHandle!, 0);
+      if (result == WAIT_OBJECT_0) {
+        await _handleAudioEvent();
+      }
+    });
+  }
+  
+  Future<void> _stopEventHandling() async {
+    await _eventSubscription?.cancel();
+    _eventSubscription = null;
+    if (_eventHandle != null) {
+      CloseHandle(_eventHandle!);
+      _eventHandle = null;
+    }
+  }
+  
   Future<void> feed(PcmArrayInt16 buffer) async {
     if (!_isInitialized) {
       _logError('Cannot feed: not initialized');
       return;
     }
-
+  
     try {
-      // Start periodic buffer checks if not already running
-      _checkTimer?.cancel();
-      _checkTimer = Timer.periodic(const Duration(milliseconds: 10), (timer) {
-        _checkBuffer();
-      });
 
       final pNumFramesPadding = calloc<UINT32>();
       check(_audioClient!.getCurrentPadding(pNumFramesPadding),
@@ -301,9 +333,8 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
 
   Future<void> release() async {
     _log('Releasing resources');
-
-    _checkTimer?.cancel();
-    _checkTimer = null;
+  
+    await _stopEventHandling();
 
     if (_audioClient != null) {
       try {
