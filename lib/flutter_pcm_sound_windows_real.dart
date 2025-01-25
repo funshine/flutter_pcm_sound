@@ -1,6 +1,6 @@
 import 'dart:ffi';
+import 'dart:isolate';
 import 'dart:typed_data';
-import 'dart:async';
 import 'package:ffi/ffi.dart';
 import 'package:win32/win32.dart';
 
@@ -13,23 +13,37 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
   IAudioClient3? _audioClient;
   IAudioRenderClient? _renderClient;
 
+  // Internal buffer: holds 16-bit PCM samples (iOS-style "mSamples")
+  final List<int> _samples = [];
+
   // Audio configuration
   int _feedThreshold = 0;
   LogLevel _logLevel = LogLevel.standard;
 
-  // Client format (what the app provides)
+  // Requested format
   int _clientSampleRate = 0;
   int _clientChannelCount = 0;
-  
-  // System format (what WASAPI wants)
+
+  // Actual WASAPI format
   int _finalSampleRate = 0;
 
-  // Buffer management
+  // WASAPI buffer
   int _bufferFrameCount = 0;
   bool _isInitialized = false;
+  bool _isPlaying = false;
+
+  // Event handling
   int? _eventHandle;
-  StreamSubscription? _eventSubscription;
-  
+  Isolate? _eventIsolate;
+  final _stopWorkerMessage = Object();
+  bool _didCoInitialize = false;
+
+  // If we've called feed callback once below threshold, avoid spamming
+  bool _didInvokeFeedCallback = false;
+
+  // -----------------------------------------------------------
+  //  Logging + WASAPI error checking
+  // -----------------------------------------------------------
   void _log(String message) {
     if (_logLevel.index >= LogLevel.standard.index) {
       print('[PCM Windows] $message');
@@ -48,98 +62,97 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
     }
   }
 
-  Future<void> setLogLevel(LogLevel level) async {
-    _logLevel = level;
-  }
-
   void check(int hr, [String? operation]) {
     if (FAILED(hr)) {
       final error = WindowsException(hr);
-      _logError(
-          '${operation ?? 'Operation'} failed: $error (0x${hr.toRadixString(16)})');
+      _logError('${operation ?? "Operation"} failed: $error (0x${hr.toRadixString(16)})');
       throw error;
     }
   }
 
-  Future<void> _handleAudioEvent() async {
-    if (!_isInitialized || FlutterPcmSound.onFeedSamplesCallback == null) {
-      await _stopEventHandling();
-      return;
-    }
-  
-    try {
-      final pNumFramesPadding = calloc<UINT32>();
-      check(_audioClient!.getCurrentPadding(pNumFramesPadding),
-          'Get current padding');
-      final framesInBuffer = pNumFramesPadding.value;
-      free(pNumFramesPadding);
+  // -----------------------------------------------------------
+  //  FlutterPcmSoundImpl interface
+  // -----------------------------------------------------------
+  @override
+  Future<void> setLogLevel(LogLevel level) async {
+    _logLevel = level;
+  }
 
-      if (framesInBuffer <= _feedThreshold) {
-        _logVerbose('Buffer needs more data: $framesInBuffer frames remaining');
-        FlutterPcmSound.onFeedSamplesCallback!(framesInBuffer);
-      }
-    } catch (e) {
-      _logError('Buffer check failed: $e');
+  @override
+  void setFeedCallback(Function(int framesRemaining)? callback) {
+    FlutterPcmSound.onFeedSamplesCallback = callback;
+    if (callback != null) {
+      _log('Feed callback set.');
+    } else {
+      _log('Feed callback cleared.');
     }
   }
 
+  @override
+  Future<void> setFeedThreshold(int threshold) async {
+    _feedThreshold = threshold;
+    _log('Feed threshold set to $_feedThreshold frames');
+  }
+
+  @override
   Future<void> setup({
     required int sampleRate,
     required int channelCount,
     IosAudioCategory iosAudioCategory = IosAudioCategory.playback,
   }) async {
     try {
-      _log('Initializing WASAPI with sample rate: $sampleRate, channels: $channelCount');
+      _log('Initializing WASAPI: sampleRate=$sampleRate, channels=$channelCount');
       _clientSampleRate = sampleRate;
       _clientChannelCount = channelCount;
 
-      // Initialize COM
-      check(CoInitializeEx(nullptr, COINIT.COINIT_APARTMENTTHREADED),
-          'COM initialization');
+      // COM init
+      final hrCoInit = CoInitializeEx(nullptr, COINIT.COINIT_APARTMENTTHREADED);
+      if (!FAILED(hrCoInit)) {
+        _didCoInitialize = true;
+      } else if (hrCoInit != RPC_E_CHANGED_MODE) {
+        throw WindowsException(hrCoInit);
+      }
 
-      // Get default audio endpoint
+      // Device
       final pDeviceEnumerator = MMDeviceEnumerator.createInstance();
       final ppDevice = calloc<COMObject>();
       check(
-          pDeviceEnumerator.getDefaultAudioEndpoint(
-              EDataFlow.eRender, ERole.eConsole, ppDevice.cast()),
-          'Get default audio endpoint');
-
-      // Create Audio Client
+        pDeviceEnumerator.getDefaultAudioEndpoint(EDataFlow.eRender, ERole.eConsole, ppDevice.cast()),
+        'Get default audio endpoint'
+      );
       final pDevice = IMMDevice(ppDevice);
+
+      // Audio client
       final iidAudioClient = convertToIID(IID_IAudioClient3);
       final ppAudioClient = calloc<COMObject>();
       check(
-          pDevice.activate(
-              iidAudioClient, CLSCTX.CLSCTX_ALL, nullptr, ppAudioClient.cast()),
-          'Activate audio client');
+        pDevice.activate(iidAudioClient, CLSCTX.CLSCTX_ALL, nullptr, ppAudioClient.cast()),
+        'Activate audio client'
+      );
       free(iidAudioClient);
-
       _audioClient = IAudioClient3(ppAudioClient);
 
-      // Set client properties before any other audio client operations
+      // Client props
       final props = calloc<AudioClientProperties>();
       props.ref
         ..cbSize = sizeOf<AudioClientProperties>()
         ..bIsOffload = 0
-        ..eCategory = 3 /* communications */
+        ..eCategory = 3 // communications
         ..Options = AUDCLNT_STREAMOPTIONS.AUDCLNT_STREAMOPTIONS_MATCH_FORMAT;
-
-      check(_audioClient!.setClientProperties(props),
-          'Set client properties');
+      check(_audioClient!.setClientProperties(props), 'Set client properties');
       free(props);
 
-      // First get mix format to see what the system wants
+      // Mix format
       final ppMixFormat = calloc<Pointer<WAVEFORMATEX>>();
-      check(_audioClient!.getMixFormat(ppMixFormat), 'Get mix format');
+      check(_audioClient!.getMixFormat(ppMixFormat), 'getMixFormat');
       final pMixFormat = ppMixFormat.value;
-      
-      // Store system format for potential upsampling later
       _finalSampleRate = pMixFormat.ref.nSamplesPerSec;
-      
-      _log('System Mix Format: ${pMixFormat.ref.nSamplesPerSec} Hz, ${pMixFormat.ref.nChannels} channels, ${pMixFormat.ref.wBitsPerSample}-bit');
+      _log('System Mix Format: '
+          '${pMixFormat.ref.nSamplesPerSec} Hz, '
+          '${pMixFormat.ref.nChannels} channels, '
+          '${pMixFormat.ref.wBitsPerSample}-bit');
 
-      // Construct our desired wave format
+      // Desired wave format
       final pWaveFormat = calloc<WAVEFORMATEX>();
       pWaveFormat.ref
         ..wFormatTag = WAVE_FORMAT_PCM
@@ -150,81 +163,75 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
         ..nAvgBytesPerSec = sampleRate * ((16 * channelCount) ~/ 8)
         ..cbSize = 0;
 
-      // Check if format is supported
       final pClosestMatch = calloc<Pointer<WAVEFORMATEX>>();
       final hr = _audioClient!.isFormatSupported(
-          AUDCLNT_SHAREMODE.AUDCLNT_SHAREMODE_SHARED,
-          pWaveFormat,
-          pClosestMatch);
+        AUDCLNT_SHAREMODE.AUDCLNT_SHAREMODE_SHARED,
+        pWaveFormat,
+        pClosestMatch
+      );
 
       Pointer<WAVEFORMATEX> formatToUse;
-      
       if (hr == S_OK) {
         _log('Requested format is directly supported');
         formatToUse = pWaveFormat;
       } else if (hr == S_FALSE && pClosestMatch.value != nullptr) {
-        _log('Using closest supported format:');
-        _log('Sample rate: ${pClosestMatch.value.ref.nSamplesPerSec}');
-        _log('Channels: ${pClosestMatch.value.ref.nChannels}');
-        _log('Bits per sample: ${pClosestMatch.value.ref.wBitsPerSample}');
+        _log('Using closest supported format');
         formatToUse = pClosestMatch.value;
       } else {
-        _log('Using mix format as fallback');
+        _log('Using system mix format fallback');
         formatToUse = pMixFormat;
       }
 
-      // Create event handle for notifications
-      _eventHandle = CreateEventEx(
-        nullptr,
-        nullptr,
-        0,
-        // https://learn.microsoft.com/en-us/windows/win32/sync/synchronization-object-security-and-access-rights
-        0x1F0003 /* EVENT_ALL_ACCESS */, 
-      );
-      if (_eventHandle == 0) {
-        throw WindowsException(HRESULT_FROM_WIN32(GetLastError()));
+      // Create event handle
+      _eventHandle = CreateEventEx(nullptr, nullptr, 0, 0x00100002 /* EVENT_MODIFY_STATE_SYNCHRONIZE */);
+      if (_eventHandle == 0 || _eventHandle == null) {
+        final le = GetLastError();
+        final hrErr = HRESULT_FROM_WIN32(le);
+        throw WindowsException(hrErr);
       }
 
-      // Initialize audio client with event notifications
-      final bufferDuration = 2000 * 10000; // 2 seconds in 100-ns units
+      // Initialize audio client in event-driven mode
+      final bufferDuration = 2000 * 10000; // 2 seconds in 100-ns
       check(
-          _audioClient!.initialize(
+              _audioClient!.initialize(
               AUDCLNT_SHAREMODE.AUDCLNT_SHAREMODE_SHARED,
-              0x80000000 | 0x08000000 | 0x00040000, // Add AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+              0x80000000 | 0x08000000 | 0x00040000,
+              /*  
+              AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+              AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+              AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+              */
               bufferDuration,
               0,
               formatToUse,
               nullptr),
-          'Initialize audio client');
+        'Initialize audio client'
+      );
 
       // Set the event handle
-      check(_audioClient!.setEventHandle(_eventHandle!),
-          'Set event handle');
+      check(_audioClient!.setEventHandle(_eventHandle!), 'Set event handle');
 
-      // Start listening for events
-      _startEventHandling();
+      // Start the isolate
+      _startEventIsolate();
 
-      // Get buffer size
-      final pBufferFrameCount = calloc<UINT32>();
-      check(_audioClient!.getBufferSize(pBufferFrameCount), 'Get buffer size');
-      _bufferFrameCount = pBufferFrameCount.value;
-      free(pBufferFrameCount);
-
+      // Get the buffer size
+      final pBufferCount = calloc<UINT32>();
+      check(_audioClient!.getBufferSize(pBufferCount), 'getBufferSize');
+      _bufferFrameCount = pBufferCount.value;
+      free(pBufferCount);
       _log('Buffer frame count: $_bufferFrameCount');
 
-      // Get render client
+      // Render client
       final iidAudioRenderClient = convertToIID(IID_IAudioRenderClient);
       final ppRenderClient = calloc<COMObject>();
       check(
-          _audioClient!.getService(iidAudioRenderClient, ppRenderClient.cast()),
-          'Get render client');
+        _audioClient!.getService(iidAudioRenderClient, ppRenderClient.cast()),
+        'Get render client'
+      );
       free(iidAudioRenderClient);
       _renderClient = IAudioRenderClient(ppRenderClient);
 
-      // Start the audio client
-      check(_audioClient!.start(), 'Start audio client');
-
-      // Clean up format allocations
+      // Cleanup wave format data
       CoTaskMemFree(ppMixFormat.value.cast());
       free(ppMixFormat);
       free(pWaveFormat);
@@ -238,105 +245,65 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
     }
   }
 
-  void _startEventHandling() {
-    _eventSubscription = Stream.periodic(const Duration(milliseconds: 1)).listen((_) async {
-      final result = WaitForSingleObject(_eventHandle!, 0);
-      // WAIT_OBJECT_0 == 0x00000000L
-      if (result == 0) {
-        await _handleAudioEvent();
-      }
-    });
-  }
-  
-  Future<void> _stopEventHandling() async {
-    await _eventSubscription?.cancel();
-    _eventSubscription = null;
-    if (_eventHandle != null) {
-      CloseHandle(_eventHandle!);
-      _eventHandle = null;
-    }
-  }
-  
+  @override
   Future<void> feed(PcmArrayInt16 buffer) async {
     if (!_isInitialized) {
       _logError('Cannot feed: not initialized');
       return;
     }
-  
-    try {
 
-      final pNumFramesPadding = calloc<UINT32>();
-      check(_audioClient!.getCurrentPadding(pNumFramesPadding),
-          'Get current padding');
-      final framesInBuffer = pNumFramesPadding.value;
-      final numFramesAvailable = _bufferFrameCount - framesInBuffer;
-      free(pNumFramesPadding);
+    // Convert the input to Int16
+    final inputSamples = buffer.bytes.buffer.asInt16List();
 
-      _logVerbose(
-          'Buffer status: $framesInBuffer buffered, $numFramesAvailable available');
-
-      if (numFramesAvailable > 0) {
-        // Convert incoming buffer to Int16List
-        final inputSamples = buffer.bytes.buffer.asInt16List();
-        
-        // Handle 24kHz -> 48kHz upsampling if needed
-        Int16List upsampledData;
-        if (_clientSampleRate == 24000 && _finalSampleRate == 48000) {
-          // Simple 2x upsampling - each sample becomes two samples
-          upsampledData = Int16List(inputSamples.length * 2);
-          for (int i = 0; i < inputSamples.length; i++) {
-            upsampledData[i * 2] = inputSamples[i];
-            upsampledData[i * 2 + 1] = inputSamples[i];
-          }
-        } else {
-          upsampledData = inputSamples;
-        }
-        
-        // Calculate frame counts based on input mono data
-        final inputFrames = upsampledData.length; // Each mono sample is one frame
-        final outputFrames = inputFrames; // Same number of frames, but stereo
-        
-        // Create output buffer with space for stereo data
-        final Float32List finalData = Float32List(outputFrames * 2); // * 2 for stereo
-        
-        // Convert and duplicate mono samples to stereo
-        for (int i = 0; i < inputFrames; i++) {
-          final float = upsampledData[i] / 32768.0;
-          finalData[i * 2] = float;     // Left channel
-          finalData[i * 2 + 1] = float; // Right channel
-        }
-
-        final framesToCopy = outputFrames < numFramesAvailable ? outputFrames : numFramesAvailable;
-
-        // Lock the WASAPI buffer
-        final pData = calloc<Pointer<Float>>();
-        check(_renderClient!.getBuffer(framesToCopy, pData.cast()), 'Get buffer');
-
-        // Copy finalData into the WASAPI buffer (now properly stereo)
-        final dst = pData.value.asTypedList(framesToCopy * 2); // * 2 for stereo
-        dst.setRange(0, framesToCopy * 2, finalData);
-
-        // Release the WASAPI buffer
-        check(_renderClient!.releaseBuffer(framesToCopy, 0), 'Release buffer');
-        free(pData);
-
-        _logVerbose('Fed $framesToCopy frames');
+    // If needed, upsample 24k->48k
+    Int16List upsampled;
+    if (_clientSampleRate == 24000 && _finalSampleRate == 48000) {
+      upsampled = Int16List(inputSamples.length * 2);
+      for (int i = 0; i < inputSamples.length; i++) {
+        final s = inputSamples[i];
+        upsampled[i * 2] = s;
+        upsampled[i * 2 + 1] = s;
       }
-    } catch (e) {
-      _logError('Feed failed: $e');
-      rethrow;
+    } else {
+      upsampled = inputSamples;
     }
+
+    // Duplicate for stereo if needed
+    Int16List finalData;
+    if (_clientChannelCount == 2) {
+      finalData = Int16List(upsampled.length * 2);
+      for (int i = 0; i < upsampled.length; i++) {
+        final s = upsampled[i];
+        finalData[i * 2] = s;     // left
+        finalData[i * 2 + 1] = s; // right
+      }
+    } else {
+      finalData = upsampled;
+    }
+
+    // Append to internal buffer
+    _samples.addAll(finalData);
+
+    // If not playing, start the audio client
+    if (!_isPlaying && _audioClient != null) {
+      final hr = _audioClient!.start();
+      if (SUCCEEDED(hr)) {
+        _isPlaying = true;
+        _logVerbose('Audio client started due to new feed data.');
+      } else {
+        _logError('Audio client failed to start: 0x${hr.toRadixString(16)}');
+      }
+    }
+
+    // Attempt to fill the WASAPI buffer right now in case there's space
+    // (Approach B: immediate fill)
+    _tryFillNow();
   }
 
-  Future<void> setFeedThreshold(int threshold) async {
-    _feedThreshold = threshold;
-    _log('Feed threshold set to $_feedThreshold frames');
-  }
-
+  @override
   Future<void> release() async {
     _log('Releasing resources');
-  
-    await _stopEventHandling();
+    await _stopEventIsolate();
 
     if (_audioClient != null) {
       try {
@@ -344,21 +311,153 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
       } catch (e) {
         _logError('Error stopping audio client: $e');
       }
+      _audioClient = null;
+    }
+    _renderClient = null;
+
+    _isInitialized = false;
+    _isPlaying = false;
+    _samples.clear();
+
+    if (_didCoInitialize) {
+      CoUninitialize();
+      _didCoInitialize = false;
+      _log('COM uninitialized.');
     }
 
-    _audioClient = null;
-    _renderClient = null;
-    _isInitialized = false;
     _log('Resources released');
   }
 
   @override
-  void setFeedCallback(Function(int p1)? callback) {
-    // TODO: implement setFeedCallback
+  void start() {
+    // If you want a "manual start," you can call onFeedSamplesCallback
+    // or just rely on feed() to start the audio client automatically.
+    FlutterPcmSound.onFeedSamplesCallback?.call(0);
   }
 
-  @override
-  void start() {
-    // TODO: implement start
+  // -----------------------------------------------------------
+  //  Attempt to fill WASAPI now, in case the user just fed data
+  // -----------------------------------------------------------
+  void _tryFillNow() {
+    if (!_isInitialized || !_isPlaying || _renderClient == null) return;
+
+    // We'll do a "while space remains" loop to fill as much as possible
+    while (true) {
+      final pPadding = calloc<UINT32>();
+      final hrPad = _audioClient!.getCurrentPadding(pPadding);
+      if (FAILED(hrPad)) {
+        free(pPadding);
+        return;
+      }
+      final framesInBuffer = pPadding.value;
+      free(pPadding);
+
+      final framesAvailable = _bufferFrameCount - framesInBuffer;
+      if (framesAvailable <= 0) break;
+
+      final framesInQueue = _samples.length ~/ _clientChannelCount;
+      if (framesInQueue == 0) break;
+
+      final framesToCopy = (framesInQueue < framesAvailable)
+          ? framesInQueue
+          : framesAvailable;
+
+      final pData = calloc<Pointer<Int16>>();
+      final hrGet = _renderClient!.getBuffer(framesToCopy, pData.cast());
+      if (!SUCCEEDED(hrGet)) {
+        free(pData);
+        break;
+      }
+
+      final totalSamples = framesToCopy * _clientChannelCount;
+      final dst = pData.value.asTypedList(totalSamples);
+      for (int i = 0; i < totalSamples; i++) {
+        dst[i] = _samples[i];
+      }
+      check(_renderClient!.releaseBuffer(framesToCopy, 0), 'releaseBuffer');
+      _samples.removeRange(0, totalSamples);
+
+      free(pData);
+    }
+
+    // If after filling, framesRemaining < threshold => feed callback
+    final framesRemaining = _samples.length ~/ _clientChannelCount;
+    if (framesRemaining <= _feedThreshold) {
+      if (!_didInvokeFeedCallback) {
+        _log('Invoking feed callback, framesRemaining=$framesRemaining');
+        FlutterPcmSound.onFeedSamplesCallback?.call(framesRemaining);
+        _didInvokeFeedCallback = true;
+      }
+    } else {
+      _didInvokeFeedCallback = false;
+    }
   }
+
+  // -----------------------------------------------------------
+  //  Worker isolate: event signaled => we try to fill again
+  // -----------------------------------------------------------
+  void _startEventIsolate() async {
+    if (_eventHandle == null) return;
+    final rp = ReceivePort();
+    _eventIsolate = await Isolate.spawn<_EventIsolateParams>(
+      _eventIsolateEntry,
+      _EventIsolateParams(
+        sendPort: rp.sendPort,
+        eventHandle: _eventHandle!,
+        stopMessage: _stopWorkerMessage,
+      ),
+      debugName: 'PCM-WASAPI-EventIsolate',
+    );
+
+    rp.listen((msg) async {
+      if (msg == null) return;
+      if (msg == _stopWorkerMessage) {
+        _eventIsolate = null;
+        return;
+      }
+      if (msg is String && msg == 'event_signaled') {
+        // Approach A: multi-pass fill
+        _tryFillNow();
+      }
+    });
+  }
+
+  Future<void> _stopEventIsolate() async {
+    if (_eventHandle != null) {
+      CloseHandle(_eventHandle!);
+      _eventHandle = null;
+    }
+    _eventIsolate?.kill(priority: Isolate.immediate);
+    _eventIsolate = null;
+  }
+}
+
+// Data for the isolate
+class _EventIsolateParams {
+  final SendPort sendPort;
+  final int eventHandle;
+  final Object stopMessage;
+  _EventIsolateParams({
+    required this.sendPort,
+    required this.eventHandle,
+    required this.stopMessage,
+  });
+}
+
+// The isolate entry: wait on the event handle
+void _eventIsolateEntry(_EventIsolateParams params) {
+  final sp = params.sendPort;
+  final handle = params.eventHandle;
+  final stopMsg = params.stopMessage;
+
+  while (true) {
+    final result = WaitForSingleObject(handle, INFINITE);
+    if (result == 0xffffffff /* WAIT_FAILED */) {
+      break;
+    }
+    if (result == 0 /* WAIT_OBJECT_0 */) {
+      sp.send('event_signaled');
+    }
+  }
+  sp.send(stopMsg);
 }
