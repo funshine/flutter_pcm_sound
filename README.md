@@ -10,6 +10,10 @@ Send real-time PCM audio (16-bit integer) to your device speakers, from your Flu
 
 FlutterPcmSound has zero dependencies besides Flutter, Android, iOS, and MacOS themselves.
 
+## Web
+
+Web support is available on [this fork](https://github.com/keyur2maru/flutter_pcm_sound/tree/master) by [@keyur2maru](https://github.com/keyur2maru)
+
 ## *Not* for Audio Files
 
 Unlike other plugins, `flutter_pcm_sound` does *not* use audio files (For example: [sound_pool](https://pub.dev/packages/soundpool)).
@@ -46,7 +50,7 @@ void onFeed(int remainingFrames) async {
 await FlutterPcmSound.setup(sampleRate: 44100, channelCount: 1);
 await FlutterPcmSound.setFeedThreshold(8000); 
 FlutterPcmSound.setFeedCallback(onFeed);
-FlutterPcmSound.start(); // just invokes your feed callback
+FlutterPcmSound.start(); // for convenience. Equivalent to calling onFeed(0);
 ```
 
 ## ⭐ Stars ⭐
