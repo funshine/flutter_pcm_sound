@@ -9,6 +9,12 @@ import 'flutter_pcm_sound.dart';
 
 FlutterPcmSoundImpl createWindowsImpl() => FlutterPcmSoundWindows();
 
+enum ResampleAlgorithm {
+  zeroOrderHold,  // 零阶保持
+  linear,         // 线性插值
+  cubic           // 三次样条
+}
+
 class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
   // WASAPI interfaces
   IAudioClient3? _audioClient;
@@ -117,6 +123,10 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
     required int channelCount,
     IosAudioCategory iosAudioCategory = IosAudioCategory.playback,
   }) async {
+    if (_isInitialized) {
+      await release();
+    }
+  
     try {
       _log('Initializing WASAPI with sample rate: $sampleRate, channels: $channelCount');
       _clientSampleRate = sampleRate;
@@ -224,7 +234,10 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
       // n.b. this *probably* wasn't required: i.e. the circular buffer should
       // be defending against this, so the capacity increase in it from 1 MB to
       // 10 MB is probably what fixed the skipping.
-      final bufferDuration = 30000 * 10000; // 30 seconds in 100-ns units
+      
+      // final bufferDuration = 30000 * 10000; // 30 seconds in 100-ns units
+      // 设置合理的默认缓冲区大小， 2025-04-21
+      final bufferDuration = (_clientSampleRate ~/ 10) * 30000; // 300ms
       check(
           _audioClient!.initialize(
               AUDCLNT_SHAREMODE.AUDCLNT_SHAREMODE_SHARED,
@@ -275,15 +288,22 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
   }
 
   void _startEventHandling() {
-    _eventSubscription = Stream.periodic(const Duration(milliseconds: 1)).listen((_) async {
+    if (_eventHandle == null) return;
+
+    _eventSubscription = Stream.periodic(const Duration(milliseconds: 10)).asyncExpand((_) async* {
       final result = WaitForSingleObject(_eventHandle!, 0);
-      // WAIT_OBJECT_0 == 0x00000000L
-      if (result == 0) {
+      if (result == WAIT_OBJECT_0) {
+        yield null;
+      }
+    }).listen((_) async {
+      try {
         await _handleAudioEvent();
+      } catch (e) {
+        _logError('Audio event handling error: $e');
       }
     });
   }
-  
+
   Future<void> _stopEventHandling() async {
     await _eventSubscription?.cancel();
     _eventSubscription = null;
@@ -293,27 +313,106 @@ class FlutterPcmSoundWindows implements FlutterPcmSoundImpl {
     }
   }
   
-Future<void> feed(PcmArrayInt16 buffer) async {
-  if (!_isInitialized) return;
-  
-  final inputSamples = buffer.bytes.buffer.asInt16List();
-  // Handle 24kHz -> 48kHz upsampling if needed
-  Int16List dataToWrite;
-  if (_clientSampleRate == 24000 && _finalSampleRate == 48000) {
-    dataToWrite = Int16List(inputSamples.length * 2);
-    for (int i = 0; i < inputSamples.length; i++) {
-      dataToWrite[i * 2] = inputSamples[i];
-      dataToWrite[i * 2 + 1] = inputSamples[i];
+  Int16List _upsample(Int16List input, int factor) {
+    final output = Int16List(input.length * factor);
+    for (int i = 0; i < input.length; i++) {
+      for (int j = 0; j < factor; j++) {
+        output[i * factor + j] = input[i];
+      }
     }
-  } else {
-    dataToWrite = inputSamples;
+    return output;
   }
-  
-  final written = _circularBuffer!.write(dataToWrite);
-  if (written < dataToWrite.length) {
-    _logError('Buffer overflow - dropped ${dataToWrite.length - written} samples');
+
+  Int16List _upsampleLinear(Int16List input, int factor) {
+    final output = Int16List(input.length * factor);
+    
+    for (int i = 0; i < input.length - 1; i++) {
+      final start = input[i];
+      final end = input[i + 1];
+      
+      for (int j = 0; j < factor; j++) {
+        final t = j / factor;
+        output[i * factor + j] = (start + (end - start) * t).round().clamp(-32768, 32767);
+      }
+    }
+    
+    // 处理最后一个样本
+    for (int j = 0; j < factor; j++) {
+      output[(input.length - 1) * factor + j] = input[input.length - 1];
+    }
+    
+    return output;
   }
-}
+
+  Int16List _upsampleCubic(Int16List input, int factor) {
+    if (input.length < 2) return _upsampleLinear(input, factor);
+    
+    final output = Int16List(input.length * factor);
+    
+    // 处理中间样本
+    for (int i = 1; i < input.length - 1; i++) {
+      final x0 = input[i - 1];
+      final x1 = input[i];
+      final x2 = input[i + 1];
+      final x3 = i < input.length - 2 ? input[i + 2] : x2;
+      
+      for (int j = 0; j < factor; j++) {
+        final t = j / factor;
+        // Catmull-Rom样条插值
+        final value = 0.5 * ((2 * x1) +
+            (-x0 + x2) * t +
+            (2 * x0 - 5 * x1 + 4 * x2 - x3) * t * t +
+            (-x0 + 3 * x1 - 3 * x2 + x3) * t * t * t);
+        
+        output[i * factor + j] = value.round().clamp(-32768, 32767);
+      }
+    }
+    
+    // 处理边界样本
+    for (int j = 0; j < factor; j++) {
+      // 第一个样本
+      output[j] = input[0];
+      // 最后一个样本
+      output[(input.length - 1) * factor + j] = input[input.length - 1];
+    }
+    
+    return output;
+  }
+
+  ResampleAlgorithm _resampleAlgorithm = ResampleAlgorithm.cubic;
+
+  Future<void> feed(PcmArrayInt16 buffer) async {
+    if (!_isInitialized) return;
+    
+    final inputSamples = buffer.bytes.buffer.asInt16List();
+    Int16List dataToWrite = inputSamples;
+
+    // WASAPI resample doesn't work
+    final factor = _finalSampleRate ~/ _clientSampleRate;
+    if (factor > 1 && _finalSampleRate % _clientSampleRate == 0) {
+      switch (_resampleAlgorithm) {
+        case ResampleAlgorithm.zeroOrderHold:
+          dataToWrite = _upsample(inputSamples, factor);
+          break;
+        case ResampleAlgorithm.linear:
+          dataToWrite = _upsampleLinear(inputSamples, factor);
+          break;
+        case ResampleAlgorithm.cubic:
+          dataToWrite = _upsampleCubic(inputSamples, factor);
+          break;
+      }
+    } else if (_clientSampleRate != _finalSampleRate) {
+      _logError('Unsupported sample rate conversion: $_clientSampleRate -> $_finalSampleRate');
+      return;
+    } else {
+      dataToWrite = inputSamples;
+    }
+    
+    final written = _circularBuffer!.write(dataToWrite);
+    if (written < dataToWrite.length) {
+      _logError('Buffer overflow - dropped ${dataToWrite.length - written} samples');
+    }
+  }
 
   Future<void> setFeedThreshold(int threshold) async {
     _feedThreshold = threshold;
@@ -325,16 +424,24 @@ Future<void> feed(PcmArrayInt16 buffer) async {
   
     await _stopEventHandling();
 
-    if (_audioClient != null) {
-      try {
+    try {
+      if (_audioClient != null) {
         _audioClient!.stop();
-      } catch (e) {
-        _logError('Error stopping audio client: $e');
       }
+    } catch (e) {
+      _logError('Error stopping audio client: $e');
     }
 
-    _audioClient = null;
     _renderClient = null;
+    _audioClient = null;
+      
+    // 释放COM
+    try {
+      CoUninitialize();
+    } catch (e) {
+      _logError('Error uninitializing COM: $e');
+    }
+
     _isInitialized = false;
     _log('Resources released');
   }
